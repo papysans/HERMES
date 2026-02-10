@@ -156,10 +156,11 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
   // --- Core: 发送到 OpenClaw ---
 
   async function sendToOpenClaw(message) {
-    // 统一用 wakeMode + channel + to，确保所有消息都路由到指定 TG 群组
+    // 统一用 wakeMode + channel + to + agentId，确保路由到 kiro agent 的 TG 群组
     const payload = {
       message,
       name: 'Hermes',
+      agentId: 'kiro',
       sessionKey: 'hermes-notifications',
       wakeMode: 'now',
       channel: 'telegram',
