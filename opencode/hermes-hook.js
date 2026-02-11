@@ -145,8 +145,15 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
       : content;
 
     const msg = `📋 PHASE_COMPLETE\n\n---\n\n${truncated}`;
-    await sendToOpenClaw(msg);
-    console.log('[Hermes] ✅ phase_complete 已发送');
+
+    // 优先直发 Telegram（绕过 Agent），回退到 OpenClaw
+    if (PERMISSION_BOT_TOKEN) {
+      await sendNotificationToTelegram(msg);
+      console.log('[Hermes] ✅ phase_complete 已直发 Telegram');
+    } else {
+      await sendToOpenClaw(msg);
+      console.log('[Hermes] ✅ phase_complete 已发送 (via OpenClaw)');
+    }
   }
 
   async function handlePermissionAsked(event) {
@@ -237,8 +244,31 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
     const props = event.properties || event;
     const errorMsg = props.message || props.error || 'Unknown error';
     const msg = `❌ ERROR: ${errorMsg}`;
-    await sendToOpenClaw(msg);
-    console.log('[Hermes] ✅ error 已发送');
+
+    // 优先直发 Telegram（绕过 Agent），回退到 OpenClaw
+    if (PERMISSION_BOT_TOKEN) {
+      await sendNotificationToTelegram(msg);
+      console.log('[Hermes] ✅ error 已直发 Telegram');
+    } else {
+      await sendToOpenClaw(msg);
+      console.log('[Hermes] ✅ error 已发送 (via OpenClaw)');
+    }
+  }
+
+  // --- Core: 直发 Telegram（通知类消息，纯文本，不走 Agent） ---
+
+  async function sendNotificationToTelegram(text) {
+    const res = await fetch(`https://api.telegram.org/bot${PERMISSION_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHANNEL,
+        text
+      })
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(`Telegram API error: ${data.description}`);
+    return data;
   }
 
   // --- Core: 发送到 OpenClaw ---
@@ -345,6 +375,7 @@ export function buildWebhookPayload(message, telegramChannel, messageType = 'not
     agentId: 'hermes',
     sessionKey,
     wakeMode: 'now',
+    deliver: true,
     channel: 'telegram',
     to: telegramChannel
   };

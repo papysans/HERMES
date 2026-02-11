@@ -11,14 +11,23 @@ Hermes 让你通过 Telegram 远程控制 [OpenCode](https://opencode.ai) TUI，
 │  Telegram    │ ◄─────► │  OpenClaw        │ ◄─────► │  OpenCode    │
 │  (你的手机)  │         │  Gateway :18789  │         │  TUI :4096   │
 └─────────────┘         └──────────────────┘         └──────────────┘
-                              │                            │
-                        Hermes Agent                 hermes-hook.js
-                        (SOUL.md)                    (插件)
+       ▲                      │                            │
+       │                Hermes Agent                 hermes-hook.js
+       │                (SOUL.md)                    (插件)
+       │
+       │    ┌──────────────────────┐
+       └────│  Permission Bot      │◄── permission-listener.js
+            │  (直发 Telegram)     │     (长轮询 callback_query)
+            └──────────────────────┘
 ```
 
 **方向 A — 用户 → OpenCode：** 你在 Telegram 发消息 → OpenClaw Hermes Agent 通过 `prompt_async` 转发到 OpenCode
 
-**方向 B — OpenCode → 用户：** OpenCode 事件触发 → `hermes-hook.js` 插件通过 webhook 发到 OpenClaw → 投递到 Telegram
+**方向 B — OpenCode → 用户（双路径）：**
+- 权限请求 + 通知：`hermes-hook.js` → Permission Bot → 直发 Telegram（绕过 Agent，避免上下文丢失）
+- 回退路径：Permission Bot 未配置时，走 OpenClaw Agent webhook（`deliver: true`）
+
+**权限回调：** 用户点击 Telegram Inline Keyboard → `permission-listener.js` 长轮询接收 → 调用 OpenCode 权限 API
 
 ## 前置条件
 
@@ -32,7 +41,11 @@ Hermes 让你通过 Telegram 远程控制 [OpenCode](https://opencode.ai) TUI，
 ```
 HERMES/
 ├── opencode/
-│   └── hermes-hook.js        # OpenCode 插件（方向 B）
+│   ├── hermes-hook.js              # OpenCode 插件（方向 B）
+│   └── lib/
+│       ├── pending-store.js        # 待处理权限请求存储（JSON 文件）
+│       ├── permission-listener.js  # Telegram 回调监听（独立进程）
+│       └── hermes-hook.test.js     # 测试（Vitest + fast-check）
 ├── openclaw/
 │   ├── SOUL.md               # Hermes Agent 行为指令
 │   ├── TOOLS.md              # Agent 工具使用指南
@@ -131,7 +144,13 @@ cp openclaw/USER.md   /path/to/hermes-workspace/
 #### 2.1 复制插件
 
 ```bash
+# 主插件
 cp opencode/hermes-hook.js ~/.config/opencode/plugins/
+
+# lib 目录（OpenCode 不递归扫描子目录，所以 lib/ 下的文件不会被当作插件加载）
+mkdir -p ~/.config/opencode/plugins/lib
+cp opencode/lib/pending-store.js ~/.config/opencode/plugins/lib/
+cp opencode/lib/permission-listener.js ~/.config/opencode/plugins/lib/
 ```
 
 #### 2.2 设置环境变量
@@ -142,6 +161,7 @@ cp opencode/hermes-hook.js ~/.config/opencode/plugins/
 export HERMES_HOOK_TOKEN="<和 openclaw.json hooks.token 一致>"
 export HERMES_OPENCLAW_URL="http://localhost:18789"
 export HERMES_TELEGRAM_CHANNEL="<你的群组 ID>"
+export HERMES_PERMISSION_BOT_TOKEN="<Permission Bot Token（推荐，启用直发 Telegram）>"
 ```
 
 然后 `source ~/.zshrc`。
@@ -154,9 +174,14 @@ export HERMES_TELEGRAM_CHANNEL="<你的群组 ID>"
 # 终端 1: 启动 OpenClaw Gateway
 openclaw gateway
 
-# 终端 2: 启动 OpenCode（在你的项目目录下）
+# 终端 2: 启动 Permission Listener（处理 Telegram 按钮回调）
+node ~/.config/opencode/plugins/lib/permission-listener.js
+
+# 终端 3: 启动 OpenCode（在你的项目目录下）
 opencode
 ```
+
+> Permission Listener 是独立的 Node.js 长轮询进程，负责接收 Telegram Inline Keyboard 的 RUN/ALWAYS/REJECT 回调并调用 OpenCode 权限 API。必须在 OpenCode 之前或同时启动。
 
 ### 4. 验证
 
@@ -200,19 +225,21 @@ curl -X POST http://localhost:18789/hooks/agent \
 
 ### 权限审批
 
-当 OpenCode 需要执行敏感操作时，你会收到类似消息：
+当 OpenCode 需要执行敏感操作时，你会在 Telegram 收到带 Inline Keyboard 的消息：
 
 ```
-🔴 需要确认 [shell]
-命令: rm -rf node_modules
-风险: high
-sid: ses_abc123
-pid: per_xyz789
+🔴 *需要确认* [shell]
 
-请回复：RUN（执行一次）/ ALWAYS（始终允许）/ REJECT（拒绝）
+*命令:* `rm -rf node_modules`
+*风险:* 🔴 high
+
+点击下方按钮操作：
+[🟢 RUN] [🔵 ALWAYS] [🔴 REJECT]
 ```
 
-回复 `RUN`、`ALWAYS` 或 `REJECT`，Agent 会自动执行对应操作。
+点击按钮即可，`permission-listener.js` 会自动调用 OpenCode API 执行对应操作。
+
+> 如果 Permission Bot 未配置，会回退到旧的文本回复模式（通过 OpenClaw Agent）。
 
 ### 通知类型
 
@@ -252,18 +279,20 @@ pid: per_xyz789
   "agentId": "hermes",
   "sessionKey": "hermes-permissions | hermes-notifications",
   "wakeMode": "now",
+  "deliver": true,
   "channel": "telegram",
   "to": "<群组 ID>"
 }
 ```
 
-`agentId` 必须与 `openclaw.json` 中 `agents.list[].id` 一致，否则消息会路由到错误的 Agent。
+`agentId` 必须与 `openclaw.json` 中 `agents.list[].id` 一致。`deliver: true` 确保 OpenClaw 将 Agent 回复直接投递到目标群组。
 
 ## 环境变量参考
 
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `HERMES_HOOK_TOKEN` | ✅ | — | OpenClaw webhook token |
+| `HERMES_PERMISSION_BOT_TOKEN` | 推荐 | — | Permission Bot token（启用直发 Telegram + Inline Keyboard） |
 | `HERMES_OPENCLAW_URL` | — | `http://localhost:18789` | OpenClaw Gateway 地址 |
 | `HERMES_TELEGRAM_CHANNEL` | — | `-5088310983` | Telegram 群组 ID |
 | `HERMES_OPENCODE_PORT` | — | `4096` | OpenCode HTTP Server 端口 |
@@ -290,8 +319,10 @@ pid: per_xyz789
 ## 已知限制
 
 - OpenCode HTTP Server 必须在本地运行（`localhost:4096`）
-- Hermes Agent 使用的模型（如 MiniMax-M2.1）指令遵循能力有限，架构层面已做防护（权限消息不含可执行命令）
+- `permission-listener.js` 必须作为独立进程运行（不能内嵌到 OpenCode 插件中）
+- Hermes Agent 使用的模型（如 MiniMax-M2.1）指令遵循能力有限，架构层面已做防护（权限和通知走直发 Telegram，不经过 Agent）
 - `session.idle` 事件的消息获取依赖 OpenCode HTTP API，偶尔可能获取失败
+- 待处理权限存储在 `/tmp/hermes-pending.json`，TTL 30 分钟，重启后自动清理过期条目
 
 ## License
 
