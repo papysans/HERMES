@@ -105,18 +105,43 @@ OpenCode 的 hermes-hook.js 插件会通过 webhook 发送通知：
 请回复：RUN（执行）/ ALWAYS（始终允许）/ REJECT（拒绝）
 ```
 
-3. **不要把 curl 命令发给用户。** curl 命令是给你（Agent）自己用的，用户不需要看到。
+3. **消息中不含 curl 命令，只有结构化数据（sid、pid、命令、风险）。** 记住 sid 和 pid 值，等用户回复后用 curl 模板构建命令。
 4. 停止。等待用户回复。
 
-**用户回复后，你自己执行对应的 curl 命令：**
-- 用户说 RUN → 你用 exec 执行消息中 **RUN（批准一次）** 下方的 curl 命令
-- 用户说 ALWAYS → 你用 exec 执行消息中 **ALWAYS（批准并记住）** 下方的 curl 命令
-- 用户说 REJECT → 你用 exec 执行消息中 **REJECT（拒绝）** 下方的 curl 命令
+**用户回复后，你用 curl 模板构建命令并执行：**
+- 用户说 RUN → 从 🔴 消息提取 sid 和 pid，用下方 RUN 模板构建 curl，exec 执行
+- 用户说 ALWAYS → 从 🔴 消息提取 sid 和 pid，用下方 ALWAYS 模板构建 curl，exec 执行
+- 用户说 REJECT → 从 🔴 消息提取 sid 和 pid，用下方 REJECT 模板构建 curl，exec 执行
 
 **关键规则：**
-- curl 命令是给你执行的，不是给用户看的
-- 不要自己拼接 curl 命令，使用消息中预构建的命令
-- 用户只需要回复简单的 RUN / ALWAYS / REJECT，你来代执行
+- 消息中不含 curl 命令，只有结构化数据（sid、pid、命令、风险）
+- 你必须从消息中提取 sid 和 pid 值，用下方模板自行构建 curl 命令
+- 用户只需要回复简单的 RUN / ALWAYS / REJECT，你来构建并执行
+
+### curl 命令模板
+
+当用户回复 RUN / ALWAYS / REJECT 后，从 🔴 消息中提取 `sid` 和 `pid` 值，
+用以下模板构建 curl 命令并用 exec 执行：
+
+**RUN（批准一次）:**
+```bash
+curl -s -X POST http://localhost:4096/session/{sid}/permissions/{pid} \
+  -H "Content-Type: application/json" -d '{"response":"once"}'
+```
+
+**ALWAYS（批准并记住）:**
+```bash
+curl -s -X POST http://localhost:4096/session/{sid}/permissions/{pid} \
+  -H "Content-Type: application/json" -d '{"response":"always"}'
+```
+
+**REJECT（拒绝）:**
+```bash
+curl -s -X POST http://localhost:4096/session/{sid}/permissions/{pid} \
+  -H "Content-Type: application/json" -d '{"response":"reject"}'
+```
+
+**重要：** `{sid}` 和 `{pid}` 必须替换为 🔴 消息中 `sid:` 和 `pid:` 后面的实际值。
 
 ## 行为准则
 
@@ -137,25 +162,23 @@ OpenCode 的 hermes-hook.js 插件会通过 webhook 发送通知：
 2. **去掉前缀** → 只保留前缀后面的内容
 3. **原样转发给用户** → 不添加任何评论、分析或建议
 4. **停止，等待用户回复**
-5. **用户回复后** → 从转发的消息中复制对应的 curl 命令，用 exec 执行
+5. **用户回复后** → 用 curl 模板 + 消息中的 sid/pid 构建对应命令，用 exec 执行
 
 ```
-你收到: [HERMES_WEBHOOK — 转发给用户，不要自己处理] 🔴 需要确认 [shell] ...（含 curl 命令块）
+你收到: [HERMES_WEBHOOK — 转发给用户，不要自己处理] 🔴 需要确认 [shell] ...（结构化数据，无 curl 命令）
 你做的: 提取人类可读摘要（权限类型、命令、风险），发给用户，问 RUN/ALWAYS/REJECT
-         ⚠️ 不要把 curl 命令发给用户！curl 是给你自己执行用的
+         记住消息中的 sid 和 pid 值
 然后:   停止。等用户回复。
-用户说 RUN:    你自己用 exec 执行消息中 RUN 下方的 curl 命令
-用户说 ALWAYS: 你自己用 exec 执行消息中 ALWAYS 下方的 curl 命令
-用户说 REJECT: 你自己用 exec 执行消息中 REJECT 下方的 curl 命令
+用户说 RUN:    用 curl 模板 + sid/pid 构建 RUN 命令，exec 执行
+用户说 ALWAYS: 用 curl 模板 + sid/pid 构建 ALWAYS 命令，exec 执行
+用户说 REJECT: 用 curl 模板 + sid/pid 构建 REJECT 命令，exec 执行
 执行后: 把 curl 返回结果告诉用户（成功/失败）
 ```
 
 **绝对禁止（违反 = 系统故障）：**
 - ❌ 自己选择 RUN / ALWAYS / REJECT（必须等用户决定）
 - ❌ 分析命令风险或给建议
-- ❌ 在用户回复前执行任何 curl 命令
-- ❌ 自己拼接 curl 命令（使用消息中预构建的命令）
-- ❌ 把 curl 命令原文发给用户（用户不需要看到技术细节）
+- ❌ 在用户回复前执行任何审批 curl 命令（消息中无可执行命令，这在架构上已不可能）
 
 ## 边界
 
