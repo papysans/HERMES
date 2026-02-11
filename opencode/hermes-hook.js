@@ -18,6 +18,19 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
   const OPENCLAW_URL = process.env.HERMES_OPENCLAW_URL || 'http://localhost:18789';
   const HOOK_TOKEN = process.env.HERMES_HOOK_TOKEN || '';
   const TELEGRAM_CHANNEL = process.env.HERMES_TELEGRAM_CHANNEL || '-5088310983';
+  const PERMISSION_BOT_TOKEN = process.env.HERMES_PERMISSION_BOT_TOKEN || '';
+
+  // Lazy imports — 避免顶层 import 导致 OpenCode 插件加载失败
+  let _pendingStore = null;
+  let _crypto = null;
+  async function getPendingStore() {
+    if (!_pendingStore) _pendingStore = await import('./lib/pending-store.js');
+    return _pendingStore;
+  }
+  async function getCrypto() {
+    if (!_crypto) _crypto = await import('node:crypto');
+    return _crypto;
+  }
 
   // 用 client.app.log 做结构化日志（TUI 可见），同时 console.log 兜底
   const log = async (level, message, extra) => {
@@ -37,6 +50,13 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
   return {
     event: async ({ event }) => {
       try {
+        // DEBUG: 记录所有事件到文件
+        try {
+          const fs = await import('node:fs');
+          const line = `${new Date().toISOString()} | ${event.type} | ${JSON.stringify(event).slice(0, 500)}\n`;
+          fs.appendFileSync('/tmp/hermes-events.log', line);
+        } catch (_) { }
+
         if (event.type === 'session.idle') {
           await handleSessionIdle(event);
         } else if (event.type === 'permission.asked') {
@@ -46,6 +66,35 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
         }
       } catch (err) {
         console.error('[Hermes] ❌ 事件处理失败:', err.message);
+      }
+    },
+
+    // 拦截 question tool — Agent 向用户提问时推送到 Telegram
+    'tool.execute.before': async (input, output) => {
+      if (input.tool === 'question' && PERMISSION_BOT_TOKEN) {
+        try {
+          const args = output.args || {};
+          // DEBUG: dump question tool args
+          try {
+            const fs = await import('node:fs');
+            const ts = new Date().toISOString().replace(/[:.]/g, '-');
+            fs.writeFileSync(`/tmp/hermes-question-${ts}.json`, JSON.stringify({ input, output }, null, 2));
+          } catch (_) { }
+
+          const text = buildTelegramQuestionMessage(args);
+          await fetch(`https://api.telegram.org/bot${PERMISSION_BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: TELEGRAM_CHANNEL,
+              text,
+              parse_mode: 'Markdown'
+            })
+          });
+          console.log('[Hermes] ✅ question 已推送到 Telegram');
+        } catch (err) {
+          console.error('[Hermes] ❌ question 推送失败:', err.message);
+        }
       }
     }
   };
@@ -131,10 +180,58 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
       : '';
 
     const risk = assessRisk(command);
-    const msg = buildPermissionMessage(sessionId, permissionId, permType, command, risk, alwaysPattern);
-    await sendToOpenClaw(msg);
+
+    // 直接发送到 Telegram（不走 OpenClaw Agent）
+    if (PERMISSION_BOT_TOKEN) {
+      await sendPermissionToTelegram(sessionId, permissionId, permType, command, risk, alwaysPattern);
+      console.log('[Hermes] ✅ permission 已直发 Telegram');
+    } else {
+      // 回退：Permission Bot 未配置时走旧路径
+      const msg = buildPermissionMessage(sessionId, permissionId, permType, command, risk, alwaysPattern);
+      await sendToOpenClaw(msg, 'permission');
+      console.log('[Hermes] ⚠️ PERMISSION_BOT_TOKEN 未设置，走 OpenClaw 旧路径');
+    }
   }
 
+
+  async function sendPermissionToTelegram(sessionId, permissionId, permType, command, risk, alwaysPattern) {
+    const crypto = await getCrypto();
+    const { addPending, updatePending: updatePendingFn } = await getPendingStore();
+    const uniqueId = crypto.randomUUID().slice(0, 8);
+
+    // 1. 存入 pending store
+    addPending(uniqueId, {
+      sid: sessionId,
+      pid: permissionId,
+      command,
+      timestamp: Date.now()
+    });
+
+    // 2. 构建消息文本和键盘
+    const text = buildTelegramPermissionMessage(permType, command, risk, alwaysPattern);
+    const keyboard = buildInlineKeyboard(uniqueId);
+
+    // 3. 调用 Telegram Bot API
+    const res = await fetch(`https://api.telegram.org/bot${PERMISSION_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHANNEL,
+        text,
+        parse_mode: 'Markdown',
+        reply_markup: keyboard
+      })
+    });
+
+    const data = await res.json();
+    if (!data.ok) throw new Error(`Telegram API error: ${data.description}`);
+
+    // 4. 更新 store 中的 messageId（用于后续编辑消息）
+    updatePendingFn(uniqueId, {
+      chatId: TELEGRAM_CHANNEL,
+      messageId: data.result.message_id
+    });
+  }
 
   async function handleSessionError(event) {
     const props = event.properties || event;
@@ -146,8 +243,8 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
 
   // --- Core: 发送到 OpenClaw ---
 
-  async function sendToOpenClaw(message) {
-    const payload = buildWebhookPayload(message, TELEGRAM_CHANNEL);
+  async function sendToOpenClaw(message, messageType = 'notification') {
+    const payload = buildWebhookPayload(message, TELEGRAM_CHANNEL, messageType);
 
     const url = `${OPENCLAW_URL}/hooks/agent`;
 
@@ -185,24 +282,24 @@ export function assessRisk(command) {
 }
 
 /**
- * 构建包含预构建 curl 命令的权限确认消息（纯函数）。
+ * 构建结构化权限确认消息（不含 curl 命令）。
  *
- * @param {string} sessionId   - OpenCode session ID
+ * @param {string} sessionId    - OpenCode session ID
  * @param {string} permissionId - OpenCode permission ID
- * @param {string} permType    - 权限类型 (e.g. "shell", "file")
- * @param {string} command     - 待审批的命令
- * @param {string} risk        - 风险等级 ("low" | "medium" | "high")
+ * @param {string} permType     - 权限类型 (e.g. "shell", "bash", "file")
+ * @param {string} command      - 待审批的命令
+ * @param {string} risk         - 风险等级 ("low" | "medium" | "high")
  * @param {string} alwaysPattern - always 模式匹配串（可为空）
- * @returns {string} 格式化的权限消息，包含 RUN/ALWAYS/REJECT curl 命令
+ * @returns {string} 结构化权限消息，不含 curl 命令
  */
 export function buildPermissionMessage(sessionId, permissionId, permType, command, risk, alwaysPattern) {
-  const OPENCODE_URL = 'http://localhost:4096';
-
   const lines = [
     `🔴 需要确认 [${permType}]`,
     '',
     `命令: ${command}`,
     `风险: ${risk}`,
+    `sid: ${sessionId}`,
+    `pid: ${permissionId}`,
   ];
 
   if (alwaysPattern) {
@@ -213,22 +310,7 @@ export function buildPermissionMessage(sessionId, permissionId, permType, comman
     '',
     '---',
     '',
-    '回复 RUN / ALWAYS / REJECT，我会执行对应命令：',
-    '',
-    '**RUN（批准一次）:**',
-    '```',
-    `curl -s -X POST ${OPENCODE_URL}/session/${sessionId}/permissions/${permissionId} -H "Content-Type: application/json" -d '{"response":"once"}'`,
-    '```',
-    '',
-    '**ALWAYS（批准并记住）:**',
-    '```',
-    `curl -s -X POST ${OPENCODE_URL}/session/${sessionId}/permissions/${permissionId} -H "Content-Type: application/json" -d '{"response":"always"}'`,
-    '```',
-    '',
-    '**REJECT（拒绝）:**',
-    '```',
-    `curl -s -X POST ${OPENCODE_URL}/session/${sessionId}/permissions/${permissionId} -H "Content-Type: application/json" -d '{"response":"reject"}'`,
-    '```'
+    '请回复：RUN（执行一次）/ ALWAYS（始终允许）/ REJECT（拒绝）'
   );
 
   return lines.join('\n');
@@ -249,14 +331,19 @@ export function applyWebhookPrefix(message) {
  *
  * @param {string} message          - 原始消息内容（未加前缀）
  * @param {string} telegramChannel  - Telegram 目标群组 ID
+ * @param {string} messageType      - 消息类型: "permission" | "notification"
  * @returns {object} 完整的 webhook payload
  */
-export function buildWebhookPayload(message, telegramChannel) {
+export function buildWebhookPayload(message, telegramChannel, messageType = 'notification') {
+  const sessionKey = messageType === 'permission'
+    ? 'hermes-permissions'
+    : 'hermes-notifications';
+
   return {
     message: applyWebhookPrefix(message),
     name: 'Hermes',
     agentId: 'hermes',
-    sessionKey: 'hermes-notifications',
+    sessionKey,
     wakeMode: 'now',
     channel: 'telegram',
     to: telegramChannel
@@ -264,3 +351,91 @@ export function buildWebhookPayload(message, telegramChannel) {
 }
 
 
+
+
+/**
+ * 构建 Telegram 权限消息文本（Markdown 格式，纯函数，可测试）。
+ *
+ * @param {string} permType      - 权限类型 (e.g. "shell", "bash", "file")
+ * @param {string} command       - 待审批的命令
+ * @param {string} risk          - 风险等级 ("low" | "medium" | "high")
+ * @param {string} alwaysPattern - always 模式匹配串（可为空）
+ * @returns {string} Markdown 格式的权限消息文本
+ */
+export function buildTelegramPermissionMessage(permType, command, risk, alwaysPattern) {
+  const riskEmoji = { high: '🔴', medium: '🟡', low: '🟢' }[risk] || '⚪';
+  const lines = [
+    `🔴 *需要确认* \\[${permType}]`,
+    '',
+    `*命令:* \`${command}\``,
+    `*风险:* ${riskEmoji} ${risk}`,
+  ];
+  if (alwaysPattern) {
+    lines.push(`*Always 模式:* ${escapeMd(alwaysPattern)}`);
+  }
+  lines.push('', '点击下方按钮操作：');
+  return lines.join('\n');
+}
+
+/**
+ * 构建 Telegram Inline Keyboard 对象（纯函数，可测试）。
+ *
+ * @param {string} uniqueId - 用于 callback_data 的唯一标识
+ * @returns {object} Telegram inline_keyboard 对象，包含 RUN/ALWAYS/REJECT 三个按钮
+ */
+export function buildInlineKeyboard(uniqueId) {
+  return {
+    inline_keyboard: [[
+      { text: '🟢 RUN', callback_data: `run:${uniqueId}` },
+      { text: '🔵 ALWAYS', callback_data: `always:${uniqueId}` },
+      { text: '🔴 REJECT', callback_data: `reject:${uniqueId}` }
+    ]]
+  };
+}
+
+/**
+ * 构建 Telegram 问题通知消息（Markdown 格式，纯函数，可测试）。
+ * 当 Agent 调用 question tool 向用户提问时，将问题和选项格式化为 Telegram 消息。
+ *
+ * @param {object} args - question tool 的参数
+ * @param {Array<object>} [args.questions] - 问题列表，每个包含 header, question, options
+ * @returns {string} Markdown 格式的问题通知消息
+ */
+export function buildTelegramQuestionMessage(args) {
+  const questions = args.questions || [];
+  if (questions.length === 0) return '❓ Agent 提问（无内容）';
+
+  const lines = ['❓ *Agent 提问*'];
+
+  for (const q of questions) {
+    if (q.header) lines.push('', `*${escapeMd(q.header)}*`);
+    if (q.question) lines.push('', escapeMd(q.question));
+
+    const opts = q.options || [];
+    if (opts.length > 0) {
+      lines.push('');
+      opts.forEach((opt, i) => {
+        const label = escapeMd(opt.label || opt.text || opt.value || '');
+        const desc = opt.description ? ` — ${escapeMd(opt.description)}` : '';
+        lines.push(`${i + 1}. ${label}${desc}`);
+      });
+      // question tool 总是追加一个自由输入选项
+      lines.push(`${opts.length + 1}. Type your own answer`);
+    }
+  }
+
+  lines.push('', '_请在 OpenCode TUI 中回答_');
+  return lines.join('\n');
+}
+
+/**
+ * 转义 Telegram MarkdownV1 特殊字符（纯函数，可测试）。
+ * MarkdownV1 中 * _ ` [ 需要转义。
+ *
+ * @param {string} text - 原始文本
+ * @returns {string} 转义后的文本
+ */
+export function escapeMd(text) {
+  if (!text) return '';
+  return String(text).replace(/([*_`\[])/g, '\\$1');
+}
