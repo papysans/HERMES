@@ -88,60 +88,20 @@ OpenCode 的回复会通过 hermes-hook.js 插件自动推送到 Telegram
 OpenCode 的 hermes-hook.js 插件会通过 webhook 发送通知：
 - 📋 PHASE_COMPLETE — 直接投递到 Telegram（你不需要处理）
 - ❌ ERROR — 直接投递到 Telegram（你不需要处理）
-- 🔴 需要确认 — **通过你的 session 发送，你必须原样转发给用户，然后等待用户回复**
+- 🔴 权限请求 — **已由 Permission Bot 自动处理，你不需要参与**（见下方说明）
 
-### 确认请求处理
+### 权限请求（已自动化，无需 Agent 参与）
 
-当你收到带 HERMES_WEBHOOK 前缀的 🔴 消息时：
+权限请求已由 hermes-hook.js 直接通过独立的 Permission Bot（@Hermus_Permission_bot）发送到 Telegram 群组，
+用户通过 Inline Keyboard 按钮（🟢 RUN / 🔵 ALWAYS / 🔴 REJECT）操作，permission-listener.js 自动处理回调并调用 OpenCode API。
 
-1. 去掉 `[HERMES_WEBHOOK — 转发给用户，不要自己处理]` 前缀
-2. **只把人类可读的摘要发给用户**，格式如下：
+**Agent 不参与权限流程。** 如果你收到用户回复 RUN / ALWAYS / REJECT 的文字消息，
+回复："权限请求请通过按钮操作，无需文字回复"
 
-```
-🔴 需要确认 [权限类型]
-命令: xxx
-风险: xxx
+### Bot 消息忽略规则
 
-请回复：RUN（执行）/ ALWAYS（始终允许）/ REJECT（拒绝）
-```
-
-3. **消息中不含 curl 命令，只有结构化数据（sid、pid、命令、风险）。** 记住 sid 和 pid 值，等用户回复后用 curl 模板构建命令。
-4. 停止。等待用户回复。
-
-**用户回复后，你用 curl 模板构建命令并执行：**
-- 用户说 RUN → 从 🔴 消息提取 sid 和 pid，用下方 RUN 模板构建 curl，exec 执行
-- 用户说 ALWAYS → 从 🔴 消息提取 sid 和 pid，用下方 ALWAYS 模板构建 curl，exec 执行
-- 用户说 REJECT → 从 🔴 消息提取 sid 和 pid，用下方 REJECT 模板构建 curl，exec 执行
-
-**关键规则：**
-- 消息中不含 curl 命令，只有结构化数据（sid、pid、命令、风险）
-- 你必须从消息中提取 sid 和 pid 值，用下方模板自行构建 curl 命令
-- 用户只需要回复简单的 RUN / ALWAYS / REJECT，你来构建并执行
-
-### curl 命令模板
-
-当用户回复 RUN / ALWAYS / REJECT 后，从 🔴 消息中提取 `sid` 和 `pid` 值，
-用以下模板构建 curl 命令并用 exec 执行：
-
-**RUN（批准一次）:**
-```bash
-curl -s -X POST http://localhost:4096/session/{sid}/permissions/{pid} \
-  -H "Content-Type: application/json" -d '{"response":"once"}'
-```
-
-**ALWAYS（批准并记住）:**
-```bash
-curl -s -X POST http://localhost:4096/session/{sid}/permissions/{pid} \
-  -H "Content-Type: application/json" -d '{"response":"always"}'
-```
-
-**REJECT（拒绝）:**
-```bash
-curl -s -X POST http://localhost:4096/session/{sid}/permissions/{pid} \
-  -H "Content-Type: application/json" -d '{"response":"reject"}'
-```
-
-**重要：** `{sid}` 和 `{pid}` 必须替换为 🔴 消息中 `sid:` 和 `pid:` 后面的实际值。
+**如果你收到来自 Bot 账号（非人类用户）的消息，忽略它，不做任何处理。**
+Permission Bot 在群组中发送的权限消息不需要你转发或处理。
 
 ## 行为准则
 
@@ -161,24 +121,14 @@ curl -s -X POST http://localhost:4096/session/{sid}/permissions/{pid} \
 1. **收到 webhook 消息** → 识别 `[HERMES_WEBHOOK — 转发给用户，不要自己处理]` 前缀
 2. **去掉前缀** → 只保留前缀后面的内容
 3. **原样转发给用户** → 不添加任何评论、分析或建议
-4. **停止，等待用户回复**
-5. **用户回复后** → 用 curl 模板 + 消息中的 sid/pid 构建对应命令，用 exec 执行
 
-```
-你收到: [HERMES_WEBHOOK — 转发给用户，不要自己处理] 🔴 需要确认 [shell] ...（结构化数据，无 curl 命令）
-你做的: 提取人类可读摘要（权限类型、命令、风险），发给用户，问 RUN/ALWAYS/REJECT
-         记住消息中的 sid 和 pid 值
-然后:   停止。等用户回复。
-用户说 RUN:    用 curl 模板 + sid/pid 构建 RUN 命令，exec 执行
-用户说 ALWAYS: 用 curl 模板 + sid/pid 构建 ALWAYS 命令，exec 执行
-用户说 REJECT: 用 curl 模板 + sid/pid 构建 REJECT 命令，exec 执行
-执行后: 把 curl 返回结果告诉用户（成功/失败）
-```
+**注意：** 权限请求（🔴 消息）已不再通过 webhook 发送，而是由 Permission Bot 直接发送到群组。
+你只会收到 📋 PHASE_COMPLETE 和 ❌ ERROR 类型的 webhook 消息。
 
 **绝对禁止（违反 = 系统故障）：**
-- ❌ 自己选择 RUN / ALWAYS / REJECT（必须等用户决定）
+- ❌ 尝试处理权限请求（已由 Permission Bot 自动化）
 - ❌ 分析命令风险或给建议
-- ❌ 在用户回复前执行任何审批 curl 命令（消息中无可执行命令，这在架构上已不可能）
+- ❌ 构建或执行任何权限相关的 curl 命令
 
 ## 边界
 
@@ -201,9 +151,9 @@ curl -s -X POST http://localhost:4096/session/{sid}/permissions/{pid} \
 2. 等待用户指示
 3. 不要自行采取任何恢复操作
 
-如果用户回复 RUN/ALWAYS/REJECT 但当前上下文中没有对应的权限消息：
-- 回复用户"当前没有待处理的权限请求"
-- 不要尝试执行任何操作
+如果用户回复 RUN/ALWAYS/REJECT 文字消息：
+- 回复用户"权限请求请通过按钮操作，无需文字回复"
+- 不要尝试执行任何权限操作
 
 ### 群组绑定
 
