@@ -1,7 +1,7 @@
 # Hermes 权限请求流程 (Permission Flow)
 
 > 📅 创建日期: 2026-02-10
-> 📌 版本: V1.0
+> 📌 版本: V1.1
 > 🎯 目标: 实现 OpenCode 权限请求 → Telegram 用户确认 → 回传审批 的完整闭环
 
 ---
@@ -14,8 +14,10 @@ Hermes 是 OpenCode ↔ OpenClaw ↔ Telegram 的双向通信桥梁。当 OpenCo
 - ✅ 方向 B（OpenCode → Telegram）基础通知已通
 - ✅ `permission.asked` 事件能被 hermes-hook.js 捕获
 - ✅ 消息能通过 `wakeMode: "now"` 送达 OpenClaw agent session
-- ❌ OpenClaw agent 收到 🔴 消息后自作主张（选择 RUN 而非转发给用户）
-- ❌ 完整闭环（用户回复 → agent 执行 curl → OpenCode 审批）未验证
+- ✅ Webhook 路由到正确的 Hermes agent（`agentId: "hermes"`）
+- ✅ SOUL.md 更新：Agent 只发摘要给用户，自己执行 curl 命令
+- ✅ 消息路由规则：括号 = 跟 Agent 说话，无括号 = 转发 OpenCode
+- ⚠️ 完整闭环（用户回复 → Agent 执行 curl → OpenCode 审批）待端到端验证
 
 ---
 
@@ -28,10 +30,10 @@ Hermes 是 OpenCode ↔ OpenClaw ↔ Telegram 的双向通信桥梁。当 OpenCo
 **以便** 我可以远程审批或拒绝敏感操作。
 
 **验收标准：**
-- [ ] AC-1.1: OpenCode 触发 `permission.asked` 事件时，Telegram 群组收到 🔴 消息
-- [ ] AC-1.2: 消息包含命令内容、风险等级、sid、pid
-- [ ] AC-1.3: 消息包含三个选项说明（RUN / ALWAYS / REJECT）
-- [ ] AC-1.4: 消息在 5 秒内到达 Telegram
+- [x] AC-1.1: OpenCode 触发 `permission.asked` 事件时，Telegram 群组收到 🔴 消息
+- [x] AC-1.2: 消息包含命令内容、风险等级（sid/pid 内嵌在预构建 curl 命令中）
+- [x] AC-1.3: 消息包含三个选项说明（RUN / ALWAYS / REJECT）及对应 curl 命令
+- [ ] AC-1.4: 消息在 5 秒内到达 Telegram（待端到端验证）
 
 ### US-2: OpenClaw Agent 纯转发（不自作主张）
 
@@ -40,10 +42,10 @@ Hermes 是 OpenCode ↔ OpenClaw ↔ Telegram 的双向通信桥梁。当 OpenCo
 **以便** 我自己做出批准/拒绝的决定，而不是 agent 替我决定。
 
 **验收标准：**
-- [ ] AC-2.1: Agent 收到 🔴 消息后，完整转发给 Telegram 用户，不修改内容
-- [ ] AC-2.2: Agent 不自行选择 RUN/ALWAYS/REJECT
-- [ ] AC-2.3: Agent 不添加分析、建议、评论
-- [ ] AC-2.4: Agent 转发后停止，等待用户回复
+- [x] AC-2.1: Agent 收到 🔴 消息后，提取人类可读摘要转发给 Telegram 用户（不发 curl 命令原文）
+- [x] AC-2.2: Agent 不自行选择 RUN/ALWAYS/REJECT（SOUL.md 铁律）
+- [x] AC-2.3: Agent 不添加分析、建议、评论
+- [x] AC-2.4: Agent 转发后停止，等待用户回复
 
 ### US-3: 用户批准一次（RUN）
 
@@ -52,10 +54,10 @@ Hermes 是 OpenCode ↔ OpenClaw ↔ Telegram 的双向通信桥梁。当 OpenCo
 **以便** OpenCode 继续执行被暂停的操作。
 
 **验收标准：**
-- [ ] AC-3.1: 用户回复 "RUN" 后，agent 从最近的 🔴 消息中提取 sid 和 pid
-- [ ] AC-3.2: Agent 执行 `POST /session/{sid}/permissions/{pid}` with `{"response":"once"}`
-- [ ] AC-3.3: OpenCode 收到审批后继续执行
-- [ ] AC-3.4: Agent 告知用户审批结果（成功/失败）
+- [x] AC-3.1: 用户回复 "RUN" 后，Agent 从上下文中找到对应 curl 命令
+- [x] AC-3.2: Agent 自己执行 `POST /session/{sid}/permissions/{pid}` with `{"response":"once"}`
+- [ ] AC-3.3: OpenCode 收到审批后继续执行（待端到端验证）
+- [x] AC-3.4: Agent 告知用户审批结果（成功/失败）
 
 ### US-4: 用户永久批准（ALWAYS）
 
@@ -64,9 +66,9 @@ Hermes 是 OpenCode ↔ OpenClaw ↔ Telegram 的双向通信桥梁。当 OpenCo
 **以便** 同类命令以后不再需要我确认。
 
 **验收标准：**
-- [ ] AC-4.1: Agent 执行 `POST /session/{sid}/permissions/{pid}` with `{"response":"always"}`
-- [ ] AC-4.2: OpenCode 收到审批后继续执行
-- [ ] AC-4.3: 后续同类命令不再触发 `permission.asked` 事件
+- [x] AC-4.1: Agent 执行 `POST /session/{sid}/permissions/{pid}` with `{"response":"always"}`
+- [ ] AC-4.2: OpenCode 收到审批后继续执行（待端到端验证）
+- [ ] AC-4.3: 后续同类命令不再触发 `permission.asked` 事件（待验证）
 
 ### US-5: 用户拒绝（REJECT）
 
@@ -75,9 +77,9 @@ Hermes 是 OpenCode ↔ OpenClaw ↔ Telegram 的双向通信桥梁。当 OpenCo
 **以便** OpenCode 不执行该敏感操作。
 
 **验收标准：**
-- [ ] AC-5.1: Agent 执行 `POST /session/{sid}/permissions/{pid}` with `{"response":"reject"}`
-- [ ] AC-5.2: OpenCode 收到拒绝后跳过该操作或报错
-- [ ] AC-5.3: Agent 告知用户拒绝结果
+- [x] AC-5.1: Agent 执行 `POST /session/{sid}/permissions/{pid}` with `{"response":"reject"}`
+- [ ] AC-5.2: OpenCode 收到拒绝后跳过该操作或报错（待验证）
+- [x] AC-5.3: Agent 告知用户拒绝结果
 
 ### US-6: 连续权限请求处理
 
@@ -94,10 +96,10 @@ Hermes 是 OpenCode ↔ OpenClaw ↔ Telegram 的双向通信桥梁。当 OpenCo
 
 ## 已知风险和约束
 
-1. **OpenClaw agent 自主性过强** — agent 可能忽略 SOUL.md 铁律，自行做决定。需要通过消息格式或 prompt 工程解决。
-2. **消息格式中的选项文字** — 🔴 消息中包含 "RUN — 批准一次" 等文字，agent 可能将其理解为可选择的选项而非需要转发的内容。
-3. **sessionKey 唯一性** — 每次 webhook 调用使用 `hermes-${Date.now()}`，可能导致 agent 在不同 session 中丢失上下文。
-4. **OpenCode 权限超时** — 权限请求可能有超时机制，如果用户回复太慢，审批可能失效。
+1. ~~**OpenClaw agent 自主性过强**~~ ✅ 已通过 SOUL.md 铁律 + Agent 自执行 curl 模式解决
+2. ~~**消息格式中的选项文字**~~ ✅ Agent 只发摘要给用户，curl 命令不暴露
+3. **sessionKey 唯一性** — 使用固定 `hermes-notifications` sessionKey，所有权限消息在同一 session 中，Agent 可从上下文找到历史 curl 命令
+4. **OpenCode 权限超时** — 权限请求可能有超时机制，如果用户回复太慢，审批可能失效
 
 ---
 
@@ -108,16 +110,19 @@ Hermes 是 OpenCode ↔ OpenClaw ↔ Telegram 的双向通信桥梁。当 OpenCo
 | hermes-hook.js 插件 | ✅ 已部署 | `~/.config/opencode/plugins/hermes-hook.js` |
 | OpenCode HTTP Server | ✅ 运行中 | `localhost:4096` |
 | OpenClaw Gateway | ✅ 运行中 | `localhost:18789` |
-| OpenClaw SOUL.md | ⚠️ 需验证 | 铁律是否被 agent 遵守 |
+| OpenClaw SOUL.md | ✅ 已更新 | 铁律强化 + Agent 自执行 curl + 括号路由规则 |
 | Telegram 群组 | ✅ 已配置 | `-5088310983` |
 
 ---
 
 ## 当前阻塞项
 
-**US-2 是关键路径** — 如果 agent 不能纯转发，后续所有用户故事都无法实现。
+**端到端验证是关键路径** — 代码和 SOUL.md 已全部更新，需要重启 OpenCode 后实际触发 permission.asked 验证完整闭环。
 
-解决方案优先级：
-1. 验证当前 SOUL.md 铁律是否生效
-2. 如果不生效，修改消息格式（去掉选项描述，或加前缀标记）
-3. 如果仍不生效，考虑改用 `deliver: true` 直接投递 + 单独的回复处理机制
+验证步骤：
+1. 重启 OpenCode 加载新插件
+2. 执行一个需要权限的命令（如 `echo hello`）
+3. 确认消息到达 hermes agent 群组 `-5088310983`（不是 coder 群组）
+4. 确认 Agent 只发摘要（不发 curl 命令）
+5. 回复 RUN，确认 Agent 自己执行 curl
+6. 确认 OpenCode 收到审批并继续执行

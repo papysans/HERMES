@@ -112,6 +112,16 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
 
     const permissionId = props.id || '';
     const sessionId = props.sessionID || '';
+
+    // sid/pid 缺失校验：跳过并记录警告
+    if (!sessionId || !permissionId) {
+      const missing = [];
+      if (!sessionId) missing.push('sessionId');
+      if (!permissionId) missing.push('permissionId');
+      console.warn(`[Hermes] ⚠️ 跳过 permission 事件：缺少 ${missing.join(', ')}`, { props });
+      return;
+    }
+
     const permType = props.permission || 'unknown';
     const command = (props.patterns && props.patterns.length > 0)
       ? props.patterns.join(' ; ')
@@ -121,29 +131,10 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
       : '';
 
     const risk = assessRisk(command);
-
-    const lines = [
-      `🔴 需要确认 [${permType}]`,
-      '',
-      `命令: ${command}`,
-      `风险: ${risk}`,
-    ];
-
-    if (alwaysPattern) {
-      lines.push(`Always 模式: ${alwaysPattern}`);
-    }
-
-    lines.push(
-      '',
-      `sid: ${sessionId}`,
-      `pid: ${permissionId}`,
-      '',
-      '等待用户回复 RUN / ALWAYS / REJECT'
-    );
-
-    const msg = lines.join('\n');
+    const msg = buildPermissionMessage(sessionId, permissionId, permType, command, risk, alwaysPattern);
     await sendToOpenClaw(msg);
   }
+
 
   async function handleSessionError(event) {
     const props = event.properties || event;
@@ -156,16 +147,7 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
   // --- Core: 发送到 OpenClaw ---
 
   async function sendToOpenClaw(message) {
-    // 统一用 wakeMode + channel + to + agentId，确保路由到 kiro agent 的 TG 群组
-    const payload = {
-      message,
-      name: 'Hermes',
-      agentId: 'kiro',
-      sessionKey: 'hermes-notifications',
-      wakeMode: 'now',
-      channel: 'telegram',
-      to: TELEGRAM_CHANNEL
-    };
+    const payload = buildWebhookPayload(message, TELEGRAM_CHANNEL);
 
     const url = `${OPENCLAW_URL}/hooks/agent`;
 
@@ -186,17 +168,99 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
     return response;
   }
 
-  // --- Utils ---
-
-  function assessRisk(command) {
-    if (!command) return 'low';
-    const cmd = String(command).toLowerCase();
-
-    const high = [/^rm\s+-rf/, /^dd\s+/, /^mkfs/, /^chmod\s+-R\s+777/, /^chown\s+-R/, /^format\s+/, /^fdisk/];
-    const medium = [/^rm\s+/, /^mv\s+/, /^sed\s+-i/, /^kill\s+-9/, /^pkill/, /^killall/];
-
-    for (const p of high) { if (p.test(cmd)) return 'high'; }
-    for (const p of medium) { if (p.test(cmd)) return 'medium'; }
-    return 'low';
-  }
 };
+
+// --- Utils (module-level pure functions, exported for testing) ---
+
+export function assessRisk(command) {
+  if (!command) return 'low';
+  const cmd = String(command).toLowerCase();
+
+  const high = [/^rm\s+-rf/, /^dd\s+/, /^mkfs/, /^chmod\s+-R\s+777/, /^chown\s+-R/, /^format\s+/, /^fdisk/];
+  const medium = [/^rm\s+/, /^mv\s+/, /^sed\s+-i/, /^kill\s+-9/, /^pkill/, /^killall/];
+
+  for (const p of high) { if (p.test(cmd)) return 'high'; }
+  for (const p of medium) { if (p.test(cmd)) return 'medium'; }
+  return 'low';
+}
+
+/**
+ * 构建包含预构建 curl 命令的权限确认消息（纯函数）。
+ *
+ * @param {string} sessionId   - OpenCode session ID
+ * @param {string} permissionId - OpenCode permission ID
+ * @param {string} permType    - 权限类型 (e.g. "shell", "file")
+ * @param {string} command     - 待审批的命令
+ * @param {string} risk        - 风险等级 ("low" | "medium" | "high")
+ * @param {string} alwaysPattern - always 模式匹配串（可为空）
+ * @returns {string} 格式化的权限消息，包含 RUN/ALWAYS/REJECT curl 命令
+ */
+export function buildPermissionMessage(sessionId, permissionId, permType, command, risk, alwaysPattern) {
+  const OPENCODE_URL = 'http://localhost:4096';
+
+  const lines = [
+    `🔴 需要确认 [${permType}]`,
+    '',
+    `命令: ${command}`,
+    `风险: ${risk}`,
+  ];
+
+  if (alwaysPattern) {
+    lines.push(`Always 模式: ${alwaysPattern}`);
+  }
+
+  lines.push(
+    '',
+    '---',
+    '',
+    '回复 RUN / ALWAYS / REJECT，我会执行对应命令：',
+    '',
+    '**RUN（批准一次）:**',
+    '```',
+    `curl -s -X POST ${OPENCODE_URL}/session/${sessionId}/permissions/${permissionId} -H "Content-Type: application/json" -d '{"response":"once"}'`,
+    '```',
+    '',
+    '**ALWAYS（批准并记住）:**',
+    '```',
+    `curl -s -X POST ${OPENCODE_URL}/session/${sessionId}/permissions/${permissionId} -H "Content-Type: application/json" -d '{"response":"always"}'`,
+    '```',
+    '',
+    '**REJECT（拒绝）:**',
+    '```',
+    `curl -s -X POST ${OPENCODE_URL}/session/${sessionId}/permissions/${permissionId} -H "Content-Type: application/json" -d '{"response":"reject"}'`,
+    '```'
+  );
+
+  return lines.join('\n');
+}
+
+/**
+ * 为 webhook 消息添加 HERMES_WEBHOOK 前缀（纯函数，可测试）。
+ *
+ * @param {string} message - 原始消息内容
+ * @returns {string} 带前缀的消息
+ */
+export function applyWebhookPrefix(message) {
+  return `[HERMES_WEBHOOK — 转发给用户，不要自己处理] ${message}`;
+}
+
+/**
+ * 构建 webhook payload 对象（纯函数，可测试）。
+ *
+ * @param {string} message          - 原始消息内容（未加前缀）
+ * @param {string} telegramChannel  - Telegram 目标群组 ID
+ * @returns {object} 完整的 webhook payload
+ */
+export function buildWebhookPayload(message, telegramChannel) {
+  return {
+    message: applyWebhookPrefix(message),
+    name: 'Hermes',
+    agentId: 'hermes',
+    sessionKey: 'hermes-notifications',
+    wakeMode: 'now',
+    channel: 'telegram',
+    to: telegramChannel
+  };
+}
+
+
