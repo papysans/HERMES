@@ -137,13 +137,15 @@ User has answered your questions: "请选择要测试的功能？"="Question". Y
 
 ## 测试工具
 
-| 文件 | 用途 |
+> 以下工具在探测阶段使用，探测完成后已清理。记录在此仅供参考。
+
+| 文件（已删除） | 用途 |
 |------|------|
-| `HERMES/opencode/lib/question-inject-test.js` | 12 种注入模式的测试插件（MODE 0-11） |
-| `HERMES/opencode/lib/watch-question.js` | SSE 事件监控，测量 asked→replied 时间差 |
-| `HERMES/opencode/lib/monitor-tui.js` | 多通道 TUI 实时监控 |
-| `HERMES/opencode/lib/run-inject-test.sh` | 测试运行器脚本 |
+| `question-inject-test.js` | 12 种注入模式的测试插件（MODE 0-11） |
+| `watch-question.js` | SSE 事件监控，测量 asked→replied 时间差 |
+| `monitor-tui.js` | 多通道 TUI 实时监控 |
+| `run-inject-test.sh` | 测试运行器脚本 |
 
 ---
 
-**最后更新**: 2026-02-11 08:50
+**最后更新**: 2026-02-11

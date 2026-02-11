@@ -47,13 +47,7 @@ HERMES/
 │   └── lib/
 │       ├── pending-store.js        # 待处理请求存储（权限 + 问题，JSON 文件）
 │       ├── permission-listener.js  # Telegram 回调监听（权限 + 问题，独立进程）
-│       ├── hermes-hook.test.js     # 测试（Vitest + fast-check）
-│       ├── explore-tui-api.js      # OpenCode TUI API 探测脚本（开发工具）
-│       ├── monitor-tui.js          # TUI 信号监控器（开发工具）
-│       ├── question-inject-test.js # Question Tool 注入实验插件（开发工具）
-│       ├── try-answer-question.js  # Question 回答实验脚本（开发工具）
-│       ├── watch-question.js       # Question 事件监控器（开发工具）
-│       └── run-inject-test.sh      # 注入测试启动脚本（开发工具）
+│       └── hermes-hook.test.js     # 测试（Vitest + fast-check PBT）
 ├── openclaw/
 │   ├── SOUL.md               # Hermes Agent 行为指令
 │   ├── TOOLS.md              # Agent 工具使用指南
@@ -249,7 +243,7 @@ curl -X POST http://localhost:18789/hooks/agent \
 
 > 如果 Permission Bot 未配置，会回退到旧的文本回复模式（通过 OpenClaw Agent）。
 
-### Agent 提问
+### Agent 提问（Question Tool 远程回答）
 
 当 OpenCode Agent 使用 question tool 向用户提问时，你会在 Telegram 收到带选项按钮的消息：
 
@@ -269,9 +263,35 @@ _点击下方按钮回答：_
 - 点击选项按钮：直接选择对应答案
 - 点击「✏️ 自定义回答」：然后在群组中直接输入文字，Listener 会自动捕获并回传
 
-回答通过两种策略送达 OpenCode：
-1. 优先使用 TUI `control/response` 端点（直接响应对话框）
-2. 回退到 `prompt_async`（作为新消息发送到 session）
+#### 为什么用 throw Error？一段无奈的探索历程
+
+> 说实话，用 throw Error 来传递正常的用户回答，这个方案我自己看着都觉得别扭。但在穷尽了所有能想到的方法之后，这是唯一能跑通的路径。如果社区里有大佬知道更优雅的做法，恳请不吝赐教 🙏
+
+OpenCode 的 question tool 会弹出一个 TUI 选择对话框，等待用户在本地终端操作。但 Hermes 的核心场景是远程控制——用户不在电脑前，没法操作 TUI。所以我们需要一种方式，从 Telegram 远程回答这个对话框。
+
+我们尝试了所有能找到的 HTTP API 端点和插件钩子，全部失败了：
+
+| 尝试的方案 | 结果 |
+|-----------|------|
+| `POST /tui/control/response` | 返回 200 但无效果——question 不走 control request 机制 |
+| `POST /session/{sid}/prompt_async` | 只追加新用户消息，不回答 question |
+| `POST /session/{sid}/message` | 同上 |
+| `POST /tui/append-prompt` + `submit-prompt` | 操作主输入框，不影响选择对话框 |
+| 修改 `output.args` 各种字段（12 种变体） | TUI 对话框照常弹出，全部无效 |
+| 设置 `output.result`、`output.skip`、返回值 | 均无效 |
+
+最后发现，在 `tool.execute.before` 钩子中 throw Error 时，question tool 状态变为 `error`，TUI 对话框不会出现，而 AI 会从错误信息中读取内容并继续执行。于是我们把用户的回答编码到 Error message 里：
+
+```javascript
+// tool.execute.before 中：
+throw new Error('User has answered your questions: "你想做什么？"="Web App". You can now continue with the user\'s answers in mind.');
+```
+
+AI 每次都能正确解读这个格式，把它当作用户的回答继续工作。整个过程 < 2 秒，TUI 对话框完全不出现。
+
+这个方案确实是 hack——用错误通道传递正常数据。但在 OpenCode 当前的插件 API 下，question tool 没有暴露任何正式的 programmatic reply 接口，`tool.execute.before` 也没有提供"替换 tool 结果"的返回值约定。throw Error 是唯一能阻止 TUI 对话框、同时让 AI 拿到回答的方式。
+
+**如果你知道更好的方法，或者 OpenCode 未来版本增加了 question reply API，请务必告诉我。** 详细的探测过程记录在 [`docs/question-tool-api-exploration_2026-02-11.md`](docs/question-tool-api-exploration_2026-02-11.md)。
 
 ### 通知类型
 
@@ -302,12 +322,21 @@ _点击下方按钮回答：_
 
 TTL 30 分钟，原子写入（tmp+rename），重启后自动清理过期条目。
 
-### 问题回答投递
+### 问题回答投递（throw Error 机制）
 
-当用户在 Telegram 回答 Agent 提问时，`permission-listener.js` 按以下优先级投递：
+当用户在 Telegram 回答 Agent 提问时，完整流程如下：
 
-1. `POST /tui/control/response` — TUI 控制端点，直接响应当前对话框
-2. `POST /session/:id/prompt_async` — 回退方案，作为新消息发送到 session
+```
+1. hermes-hook.js 的 tool.execute.before 拦截 question tool
+2. 发送问题到 Telegram（带 Inline Keyboard 选项按钮）
+3. 阻塞轮询 pending-store（1 秒间隔，5 分钟超时）
+4. permission-listener.js 收到用户点击/文字回答，写入 pending-store 的 answer 字段
+5. 轮询检测到 answer → throw new Error("User has answered your questions: ...")
+6. question tool 状态变为 error，AI 从错误信息中提取答案继续执行
+7. 超时则不 throw，正常返回让 TUI 对话框显示（回退到本地操作）
+```
+
+> 详见 README 中「为什么用 throw Error」章节和 `docs/question-tool-api-exploration_2026-02-11.md`。
 
 ### 风险评估
 
@@ -374,7 +403,7 @@ TTL 30 分钟，原子写入（tmp+rename），重启后自动清理过期条目
 - Hermes Agent 使用的模型（如 MiniMax-M2.1）指令遵循能力有限，架构层面已做防护（权限和通知走直发 Telegram，不经过 Agent）
 - `session.idle` 事件的消息获取依赖 OpenCode HTTP API，偶尔可能获取失败
 - 待处理请求存储在 `/tmp/hermes-pending.json`，TTL 30 分钟，重启后自动清理过期条目
-- 问题回答的 TUI `control/response` 端点依赖 OpenCode 版本支持，不支持时自动回退到 `prompt_async`
+- **Question Tool 远程回答使用 throw Error hack** — OpenCode 当前没有 question reply 的 programmatic API，只能通过在 `tool.execute.before` 中抛出错误来阻止 TUI 对话框并传递答案。如果未来 OpenCode 提供了正式的 question reply 接口，应当迁移到正式方案
 - 自定义回答模式下，Listener 会捕获目标群组中下一条非 Bot 文本消息作为答案，注意避免误触发
 
 ## License

@@ -50,13 +50,6 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
   return {
     event: async ({ event }) => {
       try {
-        // DEBUG: 记录所有事件到文件
-        try {
-          const fs = await import('node:fs');
-          const line = `${new Date().toISOString()} | ${event.type} | ${JSON.stringify(event).slice(0, 500)}\n`;
-          fs.appendFileSync('/tmp/hermes-events.log', line);
-        } catch (_) { }
-
         if (event.type === 'session.idle') {
           await handleSessionIdle(event);
         } else if (event.type === 'permission.asked') {
@@ -69,42 +62,40 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
       }
     },
 
-    // 拦截 question tool — Agent 向用户提问时推送到 Telegram（交互式 Inline Keyboard）
+    // 拦截 question tool — Agent 向用户提问时推送到 Telegram，阻塞轮询等待回答
     'tool.execute.before': async (input, output) => {
       if (input.tool === 'question' && PERMISSION_BOT_TOKEN) {
+        const args = output.args || {};
+        const options = (args.questions?.[0]?.options) || [];
+        // 提前提取问题文本（避免 output.args 被运行时修改导致后续 .map 失败）
+        const questionTexts = Array.isArray(args.questions)
+          ? args.questions.map(q => q.question || q.text || q.header || '')
+          : [String(args.questions?.[0]?.question || 'question')];
+
+        const crypto = await getCrypto();
+        const { addPending, updatePending: updatePendingFn, getPending: getPendingFn, removePending: removePendingFn } = await getPendingStore();
+        const uniqueId = crypto.randomUUID().slice(0, 8);
+
+        // 获取 session ID 和 call ID
+        const sessionId = input.sessionId || await getActiveSessionId();
+        const callID = input.callID || input.callId || '';
+
+        // 存入 pending store
+        addPending(uniqueId, {
+          type: 'question',
+          sid: sessionId,
+          callID,
+          options: options.map(o => ({ label: o.label || o.text || o.value || '', value: o.value || o.label || '' })),
+          timestamp: Date.now()
+        });
+
+        // 构建消息和键盘
+        const text = buildQuestionMessage(args);
+        const keyboard = buildQuestionInlineKeyboard(options, uniqueId);
+
+        // 发送到 Telegram
+        let messageId = null;
         try {
-          const args = output.args || {};
-          const options = (args.questions?.[0]?.options) || [];
-
-          // DEBUG: dump question tool args
-          try {
-            const fs = await import('node:fs');
-            const ts = new Date().toISOString().replace(/[:.]/g, '-');
-            fs.writeFileSync(`/tmp/hermes-question-${ts}.json`, JSON.stringify({ input, output }, null, 2));
-          } catch (_) { }
-
-          const crypto = await getCrypto();
-          const { addPending, updatePending: updatePendingFn } = await getPendingStore();
-          const uniqueId = crypto.randomUUID().slice(0, 8);
-
-          // 获取 session ID 和 call ID
-          const sessionId = input.sessionId || await getActiveSessionId();
-          const callID = input.callID || input.callId || '';
-
-          // 存入 pending store
-          addPending(uniqueId, {
-            type: 'question',
-            sid: sessionId,
-            callID,
-            options: options.map(o => ({ label: o.label || o.text || o.value || '', value: o.value || o.label || '' })),
-            timestamp: Date.now()
-          });
-
-          // 构建消息和键盘
-          const text = buildQuestionMessage(args);
-          const keyboard = buildQuestionInlineKeyboard(options, uniqueId);
-
-          // 发送到 Telegram
           const res = await fetch(`https://api.telegram.org/bot${PERMISSION_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -117,14 +108,51 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
           });
           const data = await res.json();
           if (data.ok) {
+            messageId = data.result.message_id;
             updatePendingFn(uniqueId, {
               chatId: TELEGRAM_CHANNEL,
-              messageId: data.result.message_id
+              messageId
             });
           }
           console.log('[Hermes] ✅ question 已推送到 Telegram (interactive)');
         } catch (err) {
           console.error('[Hermes] ❌ question 推送失败:', err.message);
+          return; // 发送失败，正常返回让 TUI 显示对话框
+        }
+
+        // 阻塞轮询：等待 Telegram 用户回答或超时
+        const POLL_INTERVAL = 1000;
+        const POLL_TIMEOUT = 5 * 60 * 1000; // 5 分钟
+        const startTime = Date.now();
+
+        while (true) {
+          await new Promise(r => setTimeout(r, POLL_INTERVAL));
+          let entry;
+          try {
+            entry = getPendingFn(uniqueId);
+          } catch (_) {
+            entry = null;
+          }
+          const result = shouldStopPolling(entry, startTime, POLL_TIMEOUT, Date.now());
+
+          if (result.stop) {
+            if (result.reason === 'answered') {
+              // 更新 Telegram 消息：显示已选择的答案，移除键盘
+              const answerText = entry?.answer ?? '';
+              await editQuestionStatus(messageId, `✅ 已选择: ${answerText}`);
+              removePendingFn(uniqueId);
+              // 构建错误消息并 throw — AI 从错误信息中提取答案
+              throw new Error(buildQuestionErrorMessage(questionTexts, [answerText]));
+            }
+            if (result.reason === 'timeout') {
+              await editQuestionStatus(messageId, '⏰ 已超时，请在本地操作');
+              removePendingFn(uniqueId);
+              return; // 正常返回，TUI 对话框显示
+            }
+            if (result.reason === 'expired') {
+              return; // 条目被清理，正常返回
+            }
+          }
         }
       }
     }
@@ -306,6 +334,32 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
   }
 
   // --- Core: 直发 Telegram（通知类消息，纯文本，不走 Agent） ---
+
+  async function editQuestionStatus(messageId, statusText) {
+    if (!messageId) return;
+    try {
+      await fetch(`https://api.telegram.org/bot${PERMISSION_BOT_TOKEN}/editMessageReplyMarkup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHANNEL,
+          message_id: messageId,
+          reply_markup: { inline_keyboard: [] }
+        })
+      });
+      await fetch(`https://api.telegram.org/bot${PERMISSION_BOT_TOKEN}/editMessageText`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHANNEL,
+          message_id: messageId,
+          text: statusText
+        })
+      });
+    } catch (err) {
+      console.log('[Hermes] editQuestionStatus 失败 (non-fatal):', err.message);
+    }
+  }
 
   async function sendNotificationToTelegram(text) {
     const res = await fetch(`https://api.telegram.org/bot${PERMISSION_BOT_TOKEN}/sendMessage`, {
@@ -556,4 +610,37 @@ export function buildQuestionMessage(args) {
 export function escapeMd(text) {
   if (!text) return '';
   return String(text).replace(/([*_`\[])/g, '\\$1');
+}
+
+/**
+ * 构建 throw Error 的消息字符串，模仿 question tool 正常完成时的输出格式。
+ * AI 从错误信息中提取答案并继续执行。
+ *
+ * @param {string[]} questions - 问题文本列表
+ * @param {string[]} answers   - 对应答案列表
+ * @returns {string} 格式化的错误消息
+ */
+export function buildQuestionErrorMessage(questions, answers) {
+  const qs = Array.isArray(questions) ? questions : [String(questions || '')];
+  const as = Array.isArray(answers) ? answers : [];
+  const pairs = qs.map((q, i) => `"${q}"="${as[i] || ''}"`);
+  return `User has answered your questions: ${pairs.join(', ')}. You can now continue with the user's answers in mind.`;
+}
+
+/**
+ * 判断轮询是否应停止。纯函数，不依赖外部状态。
+ * 优先级：expired > answered > timeout > continue
+ *
+ * @param {object|null} entry    - pending store 条目
+ * @param {number} startTime     - 轮询开始时间 (Date.now())
+ * @param {number} timeout       - 超时时长 (ms)
+ * @param {number} [now]         - 当前时间 (可选，默认 Date.now()，方便测试)
+ * @returns {{ stop: boolean, reason?: 'answered'|'timeout'|'expired' }}
+ */
+export function shouldStopPolling(entry, startTime, timeout, now) {
+  const currentTime = now ?? Date.now();
+  if (!entry) return { stop: true, reason: 'expired' };
+  if (entry.answer !== undefined) return { stop: true, reason: 'answered' };
+  if (currentTime - startTime >= timeout) return { stop: true, reason: 'timeout' };
+  return { stop: false };
 }
