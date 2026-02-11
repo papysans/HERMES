@@ -11,7 +11,7 @@
  *   HERMES_TELEGRAM_CHANNEL      - 群组 ID（默认 -5088310983）
  */
 
-import { getPending, removePending, cleanExpired } from './pending-store.js';
+import { getPending, removePending, cleanExpired, updatePending, loadStore } from './pending-store.js';
 // Note: when run from plugins/lib/, this resolves to plugins/lib/pending-store.js (same directory)
 
 const BOT_TOKEN = process.env.HERMES_PERMISSION_BOT_TOKEN;
@@ -37,6 +37,43 @@ export function actionToResponse(action) {
     const map = { run: 'once', always: 'always', reject: 'reject' };
     return map[action] || null;
 }
+
+export function isQuestionCallback(callbackData) {
+    if (!callbackData || typeof callbackData !== 'string') return false;
+    return callbackData.startsWith('qopt:') || callbackData.startsWith('qcustom:');
+}
+
+export function buildControlResponseBody(answer) {
+    return { body: String(answer) };
+}
+
+export function buildControlResponseUrl(port) {
+    return `http://localhost:${port}/tui/control/response`;
+}
+
+export function buildPromptAsyncUrl(port, sessionId) {
+    return `http://localhost:${port}/session/${sessionId}/prompt_async`;
+}
+
+export function parseQuestionCallback(callbackData) {
+    if (!callbackData || typeof callbackData !== 'string') return null;
+    if (callbackData.startsWith('qopt:')) {
+        const parts = callbackData.slice(5).split(':');
+        if (parts.length !== 2) return null;
+        const [uniqueId, indexStr] = parts;
+        const optionIndex = parseInt(indexStr, 10);
+        if (isNaN(optionIndex)) return null;
+        return { type: 'option', uniqueId, optionIndex };
+    }
+    if (callbackData.startsWith('qcustom:')) {
+        const uniqueId = callbackData.slice(8);
+        if (!uniqueId) return null;
+        return { type: 'custom', uniqueId };
+    }
+    return null;
+}
+
+
 
 // --- Telegram API helpers ---
 
@@ -94,12 +131,146 @@ async function sendErrorMessage(chatId, text) {
     });
 }
 
+// --- Question answer helpers ---
+
+async function sendAnswerToOpenCode(sessionId, content) {
+    const port = OPENCODE_PORT;
+
+    // 策略 1: 优先使用 TUI control response 端点
+    const controlUrl = buildControlResponseUrl(port);
+    const controlBody = buildControlResponseBody(content);
+    console.log(`[PermListener] 📤 尝试 control/response: content=${String(content).slice(0, 50)}`);
+
+    try {
+        const res = await fetch(controlUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(controlBody)
+        });
+        if (res.ok) {
+            console.log(`[PermListener] ✅ control/response 成功`);
+            return;
+        }
+        console.log(`[PermListener] ⚠️ control/response 失败 (${res.status})`);
+    } catch (err) {
+        console.log(`[PermListener] ⚠️ control/response 异常: ${err.message}`);
+    }
+
+    // 策略 2: 回退到 prompt_async
+    const fallbackUrl = buildPromptAsyncUrl(port, sessionId);
+    const fallbackBody = {
+        parts: [{ type: 'text', text: String(content) }]
+    };
+    console.log(`[PermListener] 📤 回退到 prompt_async: sid=${sessionId}`);
+
+    const fallbackRes = await fetch(fallbackUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(fallbackBody)
+    });
+    if (!fallbackRes.ok) {
+        const errText = await fallbackRes.text().catch(() => '');
+        throw new Error(`OpenCode 错误: prompt_async ${fallbackRes.status} ${errText}`);
+    }
+    console.log(`[PermListener] ✅ prompt_async 回退成功`);
+}
+
+async function handleQuestionCallback(query) {
+    const { data: callbackData, id: queryId, message } = query;
+    const parsed = parseQuestionCallback(callbackData);
+    console.log(`[PermListener] 📋 parseQuestionCallback 结果:`, JSON.stringify(parsed));
+    if (!parsed) {
+        await answerCallback(queryId, '无效的回调数据');
+        return;
+    }
+
+    const pending = getPending(parsed.uniqueId);
+    console.log(`[PermListener] 📋 getPending(${parsed.uniqueId}):`, pending ? `type=${pending.type}, sid=${pending.sid}` : 'null');
+    // 向后兼容：无 type 字段的条目视为权限条目，不在此处理
+    if (!pending || (pending.type && pending.type !== 'question')) {
+        await answerCallback(queryId, '问题已过期或已回答');
+        return;
+    }
+
+    if (parsed.type === 'option') {
+        const option = pending.options?.[parsed.optionIndex];
+        const answerValue = option?.value || option?.label || `选项 ${parsed.optionIndex + 1}`;
+        const answerLabel = option?.label || answerValue;
+
+        try {
+            await sendAnswerToOpenCode(pending.sid, answerValue);
+            await answerCallback(queryId, `✅ 已选择: ${answerLabel}`);
+            await editMessageResult(message.chat.id, message.message_id, message.text, `✅ 已选择: ${answerLabel}`);
+            removePending(parsed.uniqueId);
+        } catch (err) {
+            await answerCallback(queryId, `发送失败: ${err.message}`);
+        }
+    } else if (parsed.type === 'custom') {
+        updatePending(parsed.uniqueId, {
+            awaitingText: true,
+            chatId: message.chat.id,
+            messageId: message.message_id
+        });
+        await answerCallback(queryId, '请直接在群组中输入你的回答');
+    }
+}
+
+async function handleTextMessage(msg) {
+    // 过滤 1: 只处理目标群组
+    if (String(msg.chat.id) !== TELEGRAM_CHANNEL) return;
+    // 过滤 2: 忽略 Bot 消息
+    if (msg.from && msg.from.is_bot) return;
+    // 过滤 3: 必须有文本内容
+    if (!msg.text) return;
+
+    // 过滤 4: 只在有等待文本输入的问题条目时才处理
+    const store = loadStore();
+    let matchedId = null;
+    let matchedEntry = null;
+    for (const [id, entry] of Object.entries(store)) {
+        if (entry.type === 'question' && entry.awaitingText) {
+            matchedId = id;
+            matchedEntry = entry;
+            break;
+        }
+    }
+
+    if (!matchedId || !matchedEntry) return;
+
+    try {
+        await sendAnswerToOpenCode(matchedEntry.sid, msg.text);
+
+        if (matchedEntry.chatId && matchedEntry.messageId) {
+            await editMessageResult(
+                matchedEntry.chatId,
+                matchedEntry.messageId,
+                '',
+                `✅ 自定义回答: ${msg.text.slice(0, 100)}`
+            );
+        }
+
+        removePending(matchedId);
+        console.log(`[PermListener] ✅ 自定义回答已转发: ${msg.text.slice(0, 50)}`);
+    } catch (err) {
+        console.error('[PermListener] ❌ 自定义回答转发失败:', err.message);
+    }
+}
+
 // --- Core: handleCallbackQuery ---
 
 async function handleCallbackQuery(query) {
     const { data: callbackData, id: queryId, message } = query;
+    console.log(`[PermListener] 📥 收到 callback_query: data=${callbackData}, queryId=${queryId}`);
+
+    // 问题回调路由 — 优先检查
+    if (isQuestionCallback(callbackData)) {
+        console.log('[PermListener] → 路由到 handleQuestionCallback');
+        await handleQuestionCallback(query);
+        return;
+    }
 
     const parsed = parseCallbackData(callbackData);
+    console.log(`[PermListener] → 权限回调路由: parsed=`, JSON.stringify(parsed));
     if (!parsed) {
         await answerCallback(queryId, '无效的回调数据');
         return;
@@ -162,7 +333,7 @@ async function pollUpdates() {
             }
 
             const res = await fetch(
-                `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${offset}&timeout=30&allowed_updates=["callback_query"]`
+                `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${offset}&timeout=30&allowed_updates=["callback_query","message"]`
             );
             const data = await res.json();
             if (!data.ok) {
@@ -175,6 +346,8 @@ async function pollUpdates() {
                 offset = update.update_id + 1;
                 if (update.callback_query) {
                     await handleCallbackQuery(update.callback_query);
+                } else if (update.message) {
+                    await handleTextMessage(update.message);
                 }
             }
         } catch (err) {
@@ -204,7 +377,7 @@ async function main() {
         process.exit(1);
     }
     console.log(`[PermListener] ✅ 启动成功 — Bot: @${meData.result.username}`);
-    console.log(`[PermListener] 📡 开始轮询 callback_query...`);
+    console.log(`[PermListener] 📡 开始轮询 callback_query + message...`);
 
     await pollUpdates();
 }

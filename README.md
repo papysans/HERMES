@@ -17,17 +17,19 @@ Hermes 让你通过 Telegram 远程控制 [OpenCode](https://opencode.ai) TUI，
        │
        │    ┌──────────────────────┐
        └────│  Permission Bot      │◄── permission-listener.js
-            │  (直发 Telegram)     │     (长轮询 callback_query)
+            │  (直发 Telegram)     │     (长轮询 callback_query + message)
             └──────────────────────┘
 ```
 
 **方向 A — 用户 → OpenCode：** 你在 Telegram 发消息 → OpenClaw Hermes Agent 通过 `prompt_async` 转发到 OpenCode
 
 **方向 B — OpenCode → 用户（双路径）：**
-- 权限请求 + 通知：`hermes-hook.js` → Permission Bot → 直发 Telegram（绕过 Agent，避免上下文丢失）
+- 权限请求 + 通知 + 问题：`hermes-hook.js` → Permission Bot → 直发 Telegram（绕过 Agent，避免上下文丢失）
 - 回退路径：Permission Bot 未配置时，走 OpenClaw Agent webhook（`deliver: true`）
 
 **权限回调：** 用户点击 Telegram Inline Keyboard → `permission-listener.js` 长轮询接收 → 调用 OpenCode 权限 API
+
+**问题回调：** Agent 提问时推送 Inline Keyboard 到 Telegram → 用户点击选项或输入自定义回答 → `permission-listener.js` 通过 TUI control/response 或 prompt_async 回传答案
 
 ## 前置条件
 
@@ -43,16 +45,22 @@ HERMES/
 ├── opencode/
 │   ├── hermes-hook.js              # OpenCode 插件（方向 B）
 │   └── lib/
-│       ├── pending-store.js        # 待处理权限请求存储（JSON 文件）
-│       ├── permission-listener.js  # Telegram 回调监听（独立进程）
-│       └── hermes-hook.test.js     # 测试（Vitest + fast-check）
+│       ├── pending-store.js        # 待处理请求存储（权限 + 问题，JSON 文件）
+│       ├── permission-listener.js  # Telegram 回调监听（权限 + 问题，独立进程）
+│       ├── hermes-hook.test.js     # 测试（Vitest + fast-check）
+│       ├── explore-tui-api.js      # OpenCode TUI API 探测脚本（开发工具）
+│       ├── monitor-tui.js          # TUI 信号监控器（开发工具）
+│       ├── question-inject-test.js # Question Tool 注入实验插件（开发工具）
+│       ├── try-answer-question.js  # Question 回答实验脚本（开发工具）
+│       ├── watch-question.js       # Question 事件监控器（开发工具）
+│       └── run-inject-test.sh      # 注入测试启动脚本（开发工具）
 ├── openclaw/
 │   ├── SOUL.md               # Hermes Agent 行为指令
 │   ├── TOOLS.md              # Agent 工具使用指南
 │   ├── USER.md               # 用户信息模板
 │   ├── HERMES_QUICKSTART.md  # 快速启动
 │   └── HERMES_REQUIREMENTS.md
-└── docs/                     # 开发文档（可选）
+└── docs/                     # 开发文档
 ```
 
 ## 安装
@@ -172,7 +180,7 @@ export HERMES_PERMISSION_BOT_TOKEN="<Permission Bot Token（推荐，启用直�
 
 ```bash
 # 终端 1: 启动 OpenClaw Gateway
-openclaw gateway
+openclaw gateway start
 
 # 终端 2: 启动 Permission Listener（处理 Telegram 按钮回调）
 node ~/.config/opencode/plugins/lib/permission-listener.js
@@ -181,7 +189,7 @@ node ~/.config/opencode/plugins/lib/permission-listener.js
 opencode
 ```
 
-> Permission Listener 是独立的 Node.js 长轮询进程，负责接收 Telegram Inline Keyboard 的 RUN/ALWAYS/REJECT 回调并调用 OpenCode 权限 API。必须在 OpenCode 之前或同时启动。
+> Permission Listener 是独立的 Node.js 长轮询进程，负责接收 Telegram Inline Keyboard 的回调（权限审批 + 问题回答）以及群组文本消息（自定义回答），并调用 OpenCode 相应 API。必须在 OpenCode 之前或同时启动。
 
 ### 4. 验证
 
@@ -241,12 +249,37 @@ curl -X POST http://localhost:18789/hooks/agent \
 
 > 如果 Permission Bot 未配置，会回退到旧的文本回复模式（通过 OpenClaw Agent）。
 
+### Agent 提问
+
+当 OpenCode Agent 使用 question tool 向用户提问时，你会在 Telegram 收到带选项按钮的消息：
+
+```
+❓ *Agent 提问*
+
+*问题标题*
+
+问题内容...
+
+_点击下方按钮回答：_
+[选项 A]
+[选项 B]
+[✏️ 自定义回答]
+```
+
+- 点击选项按钮：直接选择对应答案
+- 点击「✏️ 自定义回答」：然后在群组中直接输入文字，Listener 会自动捕获并回传
+
+回答通过两种策略送达 OpenCode：
+1. 优先使用 TUI `control/response` 端点（直接响应对话框）
+2. 回退到 `prompt_async`（作为新消息发送到 session）
+
 ### 通知类型
 
 | 消息 | 含义 |
 |------|------|
 | 📋 PHASE_COMPLETE | OpenCode 完成一个阶段，附带 AI 回复摘要 |
 | 🔴 需要确认 | 权限请求，等待你审批 |
+| ❓ Agent 提问 | Agent 需要用户输入，带选项按钮 |
 | ❌ ERROR | OpenCode 发生错误 |
 
 ## 核心概念
@@ -257,6 +290,24 @@ curl -X POST http://localhost:18789/hooks/agent \
 
 - `hermes-permissions` — 权限请求专用 session
 - `hermes-notifications` — 通知消息专用 session
+
+### Pending Store
+
+`/tmp/hermes-pending.json` 存储待处理的权限请求和问题，每条记录包含 `type` 字段区分类型：
+
+| type | 用途 | 关键字段 |
+|------|------|---------|
+| `permission` | 权限审批 | `sid`, `pid`, `command`, `risk` |
+| `question` | Agent 提问 | `sid`, `callID`, `options`, `awaitingText` |
+
+TTL 30 分钟，原子写入（tmp+rename），重启后自动清理过期条目。
+
+### 问题回答投递
+
+当用户在 Telegram 回答 Agent 提问时，`permission-listener.js` 按以下优先级投递：
+
+1. `POST /tui/control/response` — TUI 控制端点，直接响应当前对话框
+2. `POST /session/:id/prompt_async` — 回退方案，作为新消息发送到 session
 
 ### 风险评估
 
@@ -322,7 +373,9 @@ curl -X POST http://localhost:18789/hooks/agent \
 - `permission-listener.js` 必须作为独立进程运行（不能内嵌到 OpenCode 插件中）
 - Hermes Agent 使用的模型（如 MiniMax-M2.1）指令遵循能力有限，架构层面已做防护（权限和通知走直发 Telegram，不经过 Agent）
 - `session.idle` 事件的消息获取依赖 OpenCode HTTP API，偶尔可能获取失败
-- 待处理权限存储在 `/tmp/hermes-pending.json`，TTL 30 分钟，重启后自动清理过期条目
+- 待处理请求存储在 `/tmp/hermes-pending.json`，TTL 30 分钟，重启后自动清理过期条目
+- 问题回答的 TUI `control/response` 端点依赖 OpenCode 版本支持，不支持时自动回退到 `prompt_async`
+- 自定义回答模式下，Listener 会捕获目标群组中下一条非 Bot 文本消息作为答案，注意避免误触发
 
 ## License
 

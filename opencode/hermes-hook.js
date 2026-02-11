@@ -69,11 +69,13 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
       }
     },
 
-    // 拦截 question tool — Agent 向用户提问时推送到 Telegram
+    // 拦截 question tool — Agent 向用户提问时推送到 Telegram（交互式 Inline Keyboard）
     'tool.execute.before': async (input, output) => {
       if (input.tool === 'question' && PERMISSION_BOT_TOKEN) {
         try {
           const args = output.args || {};
+          const options = (args.questions?.[0]?.options) || [];
+
           // DEBUG: dump question tool args
           try {
             const fs = await import('node:fs');
@@ -81,23 +83,70 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
             fs.writeFileSync(`/tmp/hermes-question-${ts}.json`, JSON.stringify({ input, output }, null, 2));
           } catch (_) { }
 
-          const text = buildTelegramQuestionMessage(args);
-          await fetch(`https://api.telegram.org/bot${PERMISSION_BOT_TOKEN}/sendMessage`, {
+          const crypto = await getCrypto();
+          const { addPending, updatePending: updatePendingFn } = await getPendingStore();
+          const uniqueId = crypto.randomUUID().slice(0, 8);
+
+          // 获取 session ID 和 call ID
+          const sessionId = input.sessionId || await getActiveSessionId();
+          const callID = input.callID || input.callId || '';
+
+          // 存入 pending store
+          addPending(uniqueId, {
+            type: 'question',
+            sid: sessionId,
+            callID,
+            options: options.map(o => ({ label: o.label || o.text || o.value || '', value: o.value || o.label || '' })),
+            timestamp: Date.now()
+          });
+
+          // 构建消息和键盘
+          const text = buildQuestionMessage(args);
+          const keyboard = buildQuestionInlineKeyboard(options, uniqueId);
+
+          // 发送到 Telegram
+          const res = await fetch(`https://api.telegram.org/bot${PERMISSION_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               chat_id: TELEGRAM_CHANNEL,
               text,
-              parse_mode: 'Markdown'
+              parse_mode: 'Markdown',
+              reply_markup: keyboard
             })
           });
-          console.log('[Hermes] ✅ question 已推送到 Telegram');
+          const data = await res.json();
+          if (data.ok) {
+            updatePendingFn(uniqueId, {
+              chatId: TELEGRAM_CHANNEL,
+              messageId: data.result.message_id
+            });
+          }
+          console.log('[Hermes] ✅ question 已推送到 Telegram (interactive)');
         } catch (err) {
           console.error('[Hermes] ❌ question 推送失败:', err.message);
         }
       }
     }
   };
+
+  // --- Helpers ---
+
+  async function getActiveSessionId() {
+    try {
+      const port = process.env.HERMES_OPENCODE_PORT || '4096';
+      const res = await fetch(`http://localhost:${port}/session`);
+      if (res.ok) {
+        const sessions = await res.json();
+        if (Array.isArray(sessions) && sessions.length > 0) {
+          return sessions[0].id;
+        }
+      }
+    } catch (err) {
+      console.log('[Hermes] getActiveSessionId 失败:', err.message);
+    }
+    return '';
+  }
 
   // --- Event Handlers ---
 
@@ -208,6 +257,7 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
 
     // 1. 存入 pending store
     addPending(uniqueId, {
+      type: 'permission',
       sid: sessionId,
       pid: permissionId,
       command,
@@ -458,6 +508,43 @@ export function buildTelegramQuestionMessage(args) {
   lines.push('', '_请在 OpenCode TUI 中回答_');
   return lines.join('\n');
 }
+
+/**
+ * 构建问题 Inline Keyboard
+ * 每个选项一行一个按钮，末尾追加"✏️ 自定义回答"按钮。
+ *
+ * @param {Array} options - 选项数组 [{label, text, value, ...}, ...]
+ * @param {string} uniqueId - 8 字符唯一标识
+ * @returns {object} Telegram inline_keyboard 对象
+ */
+export function buildQuestionInlineKeyboard(options, uniqueId) {
+  const rows = [];
+  for (let i = 0; i < options.length; i++) {
+    const label = options[i].label || options[i].text || options[i].value || `选项 ${i + 1}`;
+    rows.push([{ text: label, callback_data: `qopt:${uniqueId}:${i}` }]);
+  }
+  rows.push([{ text: '✏️ 自定义回答', callback_data: `qcustom:${uniqueId}` }]);
+  return { inline_keyboard: rows };
+}
+
+
+/**
+ * 构建问题消息文本（不含选项列表，选项由 Inline Keyboard 承载）
+ * @param {object} args - question tool 参数
+ * @returns {string} Markdown 格式消息文本
+ */
+export function buildQuestionMessage(args) {
+  const questions = args.questions || [];
+  if (questions.length === 0) return '❓ Agent 提问（无内容）';
+  const lines = ['❓ *Agent 提问*'];
+  for (const q of questions) {
+    if (q.header) lines.push('', `*${escapeMd(q.header)}*`);
+    if (q.question) lines.push('', escapeMd(q.question));
+  }
+  lines.push('', '_点击下方按钮回答：_');
+  return lines.join('\n');
+}
+
 
 /**
  * 转义 Telegram MarkdownV1 特殊字符（纯函数，可测试）。

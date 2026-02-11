@@ -325,7 +325,7 @@ describe('Agent 路由一致性 — Property-Based Tests', () => {
     });
 
     it('Property 4b: models.json 保留 provider key "kiro" 用于 API 路由 (Validates: Requirements 4.7)', () => {
-        const modelsPath = resolve(__dirname, '..', '..', 'HERMES_openclaw', 'agent', 'models.json');
+        const modelsPath = resolve(__dirname, '..', '..', '..', 'HERMES_openclaw', 'agent', 'models.json');
         const modelsContent = JSON.parse(readFileSync(modelsPath, 'utf-8'));
 
         // The top-level providers object must have a "kiro" key (API routing to localhost:10086)
