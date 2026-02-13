@@ -62,7 +62,8 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
       }
     },
 
-    // 拦截 question tool — Agent 向用户提问时推送到 Telegram，阻塞轮询等待回答
+    // 监听 question tool — 推送到 Telegram（不阻塞，不 throw）
+    // 用户回答由 permission-listener 通过 /question/{requestID}/reply 回传。
     'tool.execute.before': async (input, output) => {
       if (input.tool !== 'question' || !PERMISSION_BOT_TOKEN) return;
 
@@ -72,26 +73,26 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
       try {
         const args = output.args || {};
         const options = (args.questions?.[0]?.options) || [];
-        // 提前提取问题文本（避免 output.args 被运行时修改导致后续 .map 失败）
-        const questionTexts = Array.isArray(args.questions)
-          ? args.questions.map(q => q.question || q.text || q.header || '')
-          : [String(args.questions?.[0]?.question || 'question')];
-
         const crypto = await getCrypto();
-        const { addPending, updatePending: updatePendingFn, getPending: getPendingFn, removePending: removePendingFn } = await getPendingStore();
+        const { addPending, updatePending: updatePendingFn } = await getPendingStore();
         const uniqueId = crypto.randomUUID().slice(0, 8);
 
         // 获取 session ID 和 call ID
         const sessionId = input.sessionId || await getActiveSessionId();
         const callID = input.callID || input.callId || '';
 
-        debugLog(startTime, 'params_extracted', { questionCount: questionTexts.length, optionCount: options.length });
+        debugLog(startTime, 'params_extracted', {
+          optionCount: options.length,
+          sessionId,
+          callID
+        });
 
         // 存入 pending store
         addPending(uniqueId, {
           type: 'question',
           sid: sessionId,
           callID,
+          directory: directory || '',
           options: options.map(o => ({ label: o.label || o.text || o.value || '', value: o.value || o.label || '' })),
           timestamp: Date.now()
         });
@@ -127,56 +128,15 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
         } catch (err) {
           debugLog(startTime, 'telegram_send_done', { ok: false, error: err.message });
           console.error('[Hermes] ❌ question 推送失败:', err.message);
-          return; // 发送失败，正常返回让 TUI 显示对话框
-        }
-
-        // 阻塞轮询：等待 Telegram 用户回答或超时
-        const POLL_INTERVAL = 1000;
-        const POLL_TIMEOUT = 5 * 60 * 1000; // 5 分钟
-
-        debugLog(startTime, 'poll_start');
-        let iteration = 0;
-
-        while (true) {
-          await new Promise(r => setTimeout(r, POLL_INTERVAL));
-          iteration++;
-          debugLog(startTime, 'poll_iteration', { iteration });
-
-          let entry;
-          try {
-            entry = getPendingFn(uniqueId);
-          } catch (_) {
-            entry = null;
-          }
-          const result = shouldStopPolling(entry, startTime, POLL_TIMEOUT, Date.now());
-
-          if (result.stop) {
-            debugLog(startTime, 'poll_exit', { reason: result.reason, iteration });
-
-            if (result.reason === 'answered') {
-              // 更新 Telegram 消息：显示已选择的答案，移除键盘
-              const answerText = entry?.answer ?? '';
-              await editQuestionStatus(messageId, `✅ 已选择: ${answerText}`);
-              removePendingFn(uniqueId);
-              // 构建错误消息并 throw — AI 从错误信息中提取答案
-              throw new Error(buildQuestionErrorMessage(questionTexts, [answerText]));
-            }
-            if (result.reason === 'timeout') {
-              await editQuestionStatus(messageId, '⏰ 已超时，请在本地操作');
-              removePendingFn(uniqueId);
-              return; // 正常返回，TUI 对话框显示
-            }
-            if (result.reason === 'expired') {
-              return; // 条目被清理，正常返回
-            }
-          }
+          return; // 发送失败，保持 OpenCode 默认本地交互
         }
       } catch (err) {
         debugLog(startTime, 'catch_error', {
           name: err.name, message: err.message,
           stack: err.stack?.split('\n').slice(0, 3)
         });
-        throw err; // 重新抛出（answered 路径的 throw 需要传播）
+        // 不中断 tool 执行；回退到 OpenCode 默认 question 处理流程
+        return;
       } finally {
         debugLog(startTime, 'finally_exit', { totalMs: Date.now() - startTime });
       }

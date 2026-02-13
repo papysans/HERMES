@@ -74,6 +74,93 @@ export function parseQuestionCallback(callbackData) {
 }
 
 
+function withDirectory(url, directory) {
+    if (!directory) return url;
+    const sep = url.includes('?') ? '&' : '?';
+    return `${url}${sep}directory=${encodeURIComponent(directory)}`;
+}
+
+function buildQuestionListUrl(port, directory) {
+    return withDirectory(`http://localhost:${port}/question`, directory);
+}
+
+function buildQuestionReplyUrl(port, requestId, directory) {
+    return withDirectory(`http://localhost:${port}/question/${requestId}/reply`, directory);
+}
+
+function buildQuestionRejectUrl(port, requestId, directory) {
+    return withDirectory(`http://localhost:${port}/question/${requestId}/reject`, directory);
+}
+
+async function fetchQuestionList(directory) {
+    const url = buildQuestionListUrl(OPENCODE_PORT, directory);
+    const res = await fetch(url);
+    if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(`question list ${res.status} ${errText}`);
+    }
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+}
+
+function matchQuestionRequest(questions, pending) {
+    if (pending.requestID) {
+        return questions.find(q => q.id === pending.requestID) || null;
+    }
+
+    if (pending.callID) {
+        const byCall = questions.find(q => q.tool?.callID === pending.callID);
+        if (byCall) return byCall;
+    }
+
+    if (pending.sid) {
+        const bySession = questions.filter(q => q.sessionID === pending.sid);
+        if (bySession.length === 1) return bySession[0];
+    }
+
+    return null;
+}
+
+async function resolveQuestionRequest(pending, { retries = 20, intervalMs = 300 } = {}) {
+    for (let i = 0; i < retries; i++) {
+        const questions = await fetchQuestionList(pending.directory);
+        const matched = matchQuestionRequest(questions, pending);
+        if (matched) return matched;
+        if (i < retries - 1) await sleep(intervalMs);
+    }
+    return null;
+}
+
+async function replyQuestion(pending, answerValue) {
+    const matched = await resolveQuestionRequest(pending);
+    if (!matched) {
+        throw new Error('未找到匹配的 question requestID');
+    }
+
+    const url = buildQuestionReplyUrl(OPENCODE_PORT, matched.id, pending.directory);
+    const payload = {
+        answers: [[String(answerValue)]]
+    };
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(`question reply ${res.status} ${errText}`);
+    }
+    return matched.id;
+}
+
+async function rejectQuestion(pending) {
+    const matched = await resolveQuestionRequest(pending, { retries: 2, intervalMs: 200 });
+    if (!matched) return false;
+    const url = buildQuestionRejectUrl(OPENCODE_PORT, matched.id, pending.directory);
+    const res = await fetch(url, { method: 'POST' });
+    return res.ok;
+}
+
 
 // --- Telegram API helpers ---
 
@@ -131,66 +218,6 @@ async function sendErrorMessage(chatId, text) {
     });
 }
 
-// --- Question answer helpers ---
-
-/**
- * 将答案发送到 OpenCode（仅限权限相关或未来非 question 用途）。
- *
- * ⚠️ 此函数 **禁止** 从 question 回调处理路径调用。
- *
- * Question 答案的正确路径是：
- *   1. Permission Listener 写入 Pending Store 的 `answer` 字段（updatePending）
- *   2. hermes-hook.js 的 Polling Loop 检测到 answer
- *   3. Polling Loop 通过 throw Error 将答案注入 AI
- *
- * 直接调用此函数发送 question 答案会与 Polling Loop 产生竞争条件，
- * 且 prompt_async 回退路径可能被 Agent 利用来自主回答（参见 P5/P6 问题记录）。
- *
- * @param {string} sessionId - OpenCode session ID
- * @param {string} content - 要发送的内容
- */
-async function sendAnswerToOpenCode(sessionId, content) {
-    const port = OPENCODE_PORT;
-
-    // 策略 1: 优先使用 TUI control response 端点
-    const controlUrl = buildControlResponseUrl(port);
-    const controlBody = buildControlResponseBody(content);
-    console.log(`[PermListener] 📤 尝试 control/response: content=${String(content).slice(0, 50)}`);
-
-    try {
-        const res = await fetch(controlUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(controlBody)
-        });
-        if (res.ok) {
-            console.log(`[PermListener] ✅ control/response 成功`);
-            return;
-        }
-        console.log(`[PermListener] ⚠️ control/response 失败 (${res.status})`);
-    } catch (err) {
-        console.log(`[PermListener] ⚠️ control/response 异常: ${err.message}`);
-    }
-
-    // 策略 2: 回退到 prompt_async
-    const fallbackUrl = buildPromptAsyncUrl(port, sessionId);
-    const fallbackBody = {
-        parts: [{ type: 'text', text: String(content) }]
-    };
-    console.log(`[PermListener] 📤 回退到 prompt_async: sid=${sessionId}`);
-
-    const fallbackRes = await fetch(fallbackUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(fallbackBody)
-    });
-    if (!fallbackRes.ok) {
-        const errText = await fallbackRes.text().catch(() => '');
-        throw new Error(`OpenCode 错误: prompt_async ${fallbackRes.status} ${errText}`);
-    }
-    console.log(`[PermListener] ✅ prompt_async 回退成功`);
-}
-
 async function handleQuestionCallback(query) {
     const { data: callbackData, id: queryId, message } = query;
     const parsed = parseQuestionCallback(callbackData);
@@ -213,11 +240,17 @@ async function handleQuestionCallback(query) {
         const answerValue = option?.value || option?.label || `选项 ${parsed.optionIndex + 1}`;
         const answerLabel = option?.label || answerValue;
 
-        // 写入 answer 字段，由 hermes-hook.js 轮询端读取并 throw Error
-        // 不再调用 sendAnswerToOpenCode、editMessage、removePending — 轮询端统一处理
-        updatePending(parsed.uniqueId, { answer: answerValue });
-        await answerCallback(queryId, `✅ 已选择: ${answerLabel}`);
-        console.log(`[PermListener] ✅ 问题回答已写入 pending store: ${answerLabel}`);
+        try {
+            const requestID = await replyQuestion(pending, answerValue);
+            updatePending(parsed.uniqueId, { requestID });
+            await answerCallback(queryId, `✅ 已选择: ${answerLabel}`);
+            await editMessageResult(message.chat.id, message.message_id, message.text || '❓ Agent 提问', `✅ 已选择: ${answerLabel}`);
+            removePending(parsed.uniqueId);
+            console.log(`[PermListener] ✅ question 已回传 OpenCode: requestID=${requestID} answer=${answerLabel}`);
+        } catch (err) {
+            await answerCallback(queryId, '回传失败，请稍后重试');
+            await sendErrorMessage(message.chat.id, `问题回答回传失败: ${err.message}`);
+        }
     } else if (parsed.type === 'custom') {
         updatePending(parsed.uniqueId, {
             awaitingText: true,
@@ -250,10 +283,17 @@ async function handleTextMessage(msg) {
 
     if (!matchedId || !matchedEntry) return;
 
-    // 写入 answer 字段，由 hermes-hook.js 轮询端读取并 throw Error
-    // 不再调用 sendAnswerToOpenCode、editMessage、removePending — 轮询端统一处理
-    updatePending(matchedId, { answer: msg.text, awaitingText: false });
-    console.log(`[PermListener] ✅ 自定义回答已写入 pending store: ${msg.text.slice(0, 50)}`);
+    try {
+        const requestID = await replyQuestion(matchedEntry, msg.text);
+        if (matchedEntry.chatId && matchedEntry.messageId) {
+            await editExpiredMessage(matchedEntry.chatId, matchedEntry.messageId);
+        }
+        removePending(matchedId);
+        console.log(`[PermListener] ✅ 自定义回答已回传 OpenCode: requestID=${requestID}`);
+    } catch (err) {
+        console.error('[PermListener] ❌ 自定义回答回传失败:', err.message);
+        await sendErrorMessage(msg.chat.id, `自定义回答回传失败: ${err.message}`);
+    }
 }
 
 // --- Core: handleCallbackQuery ---
@@ -327,6 +367,13 @@ async function pollUpdates() {
             // 清理过期条目
             const expired = cleanExpired();
             for (const entry of expired) {
+                if (entry.type === 'question') {
+                    try {
+                        await rejectQuestion(entry);
+                    } catch (err) {
+                        console.warn('[PermListener] question reject 失败 (non-fatal):', err.message);
+                    }
+                }
                 if (entry.chatId && entry.messageId) {
                     await editExpiredMessage(entry.chatId, entry.messageId);
                 }

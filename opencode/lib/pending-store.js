@@ -14,7 +14,7 @@ import { readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
 const STORE_PATH = '/tmp/hermes-pending.json';
 const STORE_TMP = '/tmp/hermes-pending.tmp.json';
 const TTL_MS = 30 * 60 * 1000; // 30 minutes
-export const QUESTION_TTL_MS = 6 * 60 * 1000; // 6 分钟（5 分钟轮询超时 + 1 分钟缓冲）
+export const QUESTION_TTL_MS = 30 * 60 * 1000; // 30 分钟（与主 TTL 对齐）
 
 export function loadStore() {
     if (!existsSync(STORE_PATH)) return {};

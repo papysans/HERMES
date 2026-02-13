@@ -96,7 +96,7 @@ Telegram 群组 (转发结果/确认请求)
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
-                    Telegram 群组 (-5088310983)
+                    Telegram 群组 (-5088311083)
 ```
 
 ---
@@ -433,7 +433,7 @@ function sendConfirmRequest(data) {
 
   return messageGateway.send({
     channel: 'telegram',
-    target: '-5088310983',
+    target: '-5088311083',
     message
   });
 }
@@ -443,7 +443,7 @@ function sendPhaseComplete(data) {
 
   return messageGateway.send({
     channel: 'telegram',
-    target: '-5088310983',
+    target: '-5088311083',
     message
   });
 }
@@ -522,7 +522,7 @@ OpenCode Plugin (kiro-hook.js)
 OpenClaw /hooks/agent
       │
       ▼
-Telegram (-5088310983)
+Telegram (-5088311083)
 ```
 
 ### 6.5 在 tmux 中运行 OpenCode（Mac 休眠保持）
