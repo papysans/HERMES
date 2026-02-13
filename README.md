@@ -29,7 +29,7 @@ Hermes 让你通过 Telegram 远程控制 [OpenCode](https://opencode.ai) TUI，
 
 **权限回调：** 用户点击 Telegram Inline Keyboard → `permission-listener.js` 长轮询接收 → 调用 OpenCode 权限 API
 
-**问题回调：** Agent 提问时推送 Inline Keyboard 到 Telegram → 用户点击选项或输入自定义回答 → `permission-listener.js` 通过 TUI control/response 或 prompt_async 回传答案
+**问题回调：** Agent 提问时推送 Inline Keyboard 到 Telegram → 用户点击选项或输入自定义回答 → `permission-listener.js` 通过官方 Question API（`/question` + `/reply`）回传答案
 
 ## 前置条件
 
@@ -261,7 +261,8 @@ _点击下方按钮回答：_
 ```
 
 - 点击选项按钮：直接选择对应答案
-- 点击「✏️ 自定义回答」：然后在群组中直接输入文字，Listener 会自动捕获并回传
+- 点击「✏️ 自定义回答」：会收到 Permission Bot 的“请回复此消息输入回答”提示，必须在群组里回复该提示消息
+- 也支持直接发送普通文本作为回退模式（按最近活跃问题匹配），但推荐优先使用“回复提示消息”的方式，避免误路由
 
 #### Question Tool 正式回传链路（无 throw hack）
 
@@ -281,6 +282,18 @@ _点击下方按钮回答：_
 4. OpenCode 将 tool 状态标记为 `completed`，并继续执行后续步骤。
 
 这条链路不再依赖异常通道传值，避免了 `throw Error` 带来的语义和可维护性问题。
+
+#### 自定义回答正确姿势（2026-02-13 实测）
+
+1. 先点击「✏️ 自定义回答」。  
+2. 等 Permission Bot 发出“请回复此消息输入回答”。  
+3. 直接回复这条提示消息（reply），不要发给 Napsta 业务机器人。  
+4. Listener 检测到 `reply_to_message_id` 命中后，立即走 `/question/{requestID}/reply` 回传。
+
+常见误操作：
+
+- 在等待回答时发送 `@Napsta...` 文本，会被当成普通任务转发到 OpenCode，而不是 question answer。  
+- 不回复提示消息、只发一条普通文本，可能被并发上下文抢占，表现为 `QUEUED`。
 
 > 历史探索记录仍保留在 [`docs/question-tool-api-exploration_2026-02-11.md`](docs/question-tool-api-exploration_2026-02-11.md)。
 
@@ -419,7 +432,7 @@ curl -s "http://127.0.0.1:4096/question?directory=$PWD" | jq '.'
 - `session.idle` 事件的消息获取依赖 OpenCode HTTP API，偶尔可能获取失败
 - 待处理请求存储在 `/tmp/hermes-pending.json`，TTL 30 分钟，重启后自动清理过期条目
 - Question Tool 远程回答已迁移到官方 `/question` API；如 API 行为变化，需要同步调整 `permission-listener.js` 的 requestID 匹配逻辑（`callID + sessionID`）
-- 自定义回答模式下，Listener 会捕获目标群组中下一条非 Bot 文本消息作为答案，注意避免误触发
+- 自定义回答推荐使用“回复 Permission Bot 提示消息”；未 reply 时会走回退匹配，极端并发下仍存在误匹配风险
 
 ## License
 

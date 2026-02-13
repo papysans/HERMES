@@ -11,7 +11,7 @@
  *   HERMES_TELEGRAM_CHANNEL      - 群组 ID（默认 -5088310983）
  */
 
-import { getPending, removePending, cleanExpired, updatePending, loadStore } from './pending-store.js';
+import { getPending, removePending, cleanExpired, updatePending, loadStore, QUESTION_TTL_MS } from './pending-store.js';
 // Note: when run from plugins/lib/, this resolves to plugins/lib/pending-store.js (same directory)
 
 const BOT_TOKEN = process.env.HERMES_PERMISSION_BOT_TOKEN;
@@ -90,6 +90,14 @@ function buildQuestionReplyUrl(port, requestId, directory) {
 
 function buildQuestionRejectUrl(port, requestId, directory) {
     return withDirectory(`http://localhost:${port}/question/${requestId}/reject`, directory);
+}
+
+function normalizeGroupAnswerText(text) {
+    if (text == null) return '';
+    let out = String(text).trim();
+    // 支持群组中以 @bot 前缀发送答案，例如：@Napsta6100ks_bot echo hello
+    out = out.replace(/^@\S+\s+/, '');
+    return out.trim();
 }
 
 async function fetchQuestionList(directory) {
@@ -218,6 +226,32 @@ async function sendErrorMessage(chatId, text) {
     });
 }
 
+async function sendInfoMessage(chatId, text) {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text })
+    });
+}
+
+async function sendForceReplyPrompt(chatId, text) {
+    const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            chat_id: chatId,
+            text,
+            reply_markup: {
+                force_reply: true,
+                selective: false
+            }
+        })
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(`Telegram force_reply 发送失败: ${data.description}`);
+    return data.result?.message_id ?? null;
+}
+
 async function handleQuestionCallback(query) {
     const { data: callbackData, id: queryId, message } = query;
     const parsed = parseQuestionCallback(callbackData);
@@ -252,12 +286,27 @@ async function handleQuestionCallback(query) {
             await sendErrorMessage(message.chat.id, `问题回答回传失败: ${err.message}`);
         }
     } else if (parsed.type === 'custom') {
+        let promptMessageId = null;
+        try {
+            promptMessageId = await sendForceReplyPrompt(
+                message.chat.id,
+                '✏️ 请输入自定义回答（请直接回复这条消息）：'
+            );
+        } catch (err) {
+            console.warn('[PermListener] force_reply 提示发送失败:', err.message);
+        }
+
         updatePending(parsed.uniqueId, {
             awaitingText: true,
             chatId: message.chat.id,
-            messageId: message.message_id
+            messageId: message.message_id,
+            customPromptMessageId: promptMessageId
         });
-        await answerCallback(queryId, '请直接在群组中输入你的回答');
+        await answerCallback(queryId, '请回复我刚发的输入提示消息');
+        await sendInfoMessage(
+            message.chat.id,
+            '✏️ 请使用“回复（Reply）”方式回复 Permission Bot 的输入提示消息。\n不要 @Napsta6100ks_bot 转发，否则会被当作普通任务。'
+        );
     }
 }
 
@@ -268,28 +317,72 @@ async function handleTextMessage(msg) {
     if (msg.from && msg.from.is_bot) return;
     // 过滤 3: 必须有文本内容
     if (!msg.text) return;
+    // 过滤 4: 忽略命令消息
+    const normalized = normalizeGroupAnswerText(msg.text);
+    if (!normalized || normalized.startsWith('/')) return;
 
-    // 过滤 4: 只在有等待文本输入的问题条目时才处理
+    console.log(
+        `[PermListener] 📨 收到 message: chat=${msg.chat.id}, replyTo=${msg.reply_to_message?.message_id ?? 'none'}, text=${normalized.slice(0, 80)}`
+    );
+
+    // 先匹配 awaitingText，并优先匹配 reply_to_message（在群隐私模式下更稳定）
     const store = loadStore();
+    const now = Date.now();
     let matchedId = null;
     let matchedEntry = null;
-    for (const [id, entry] of Object.entries(store)) {
-        if (entry.type === 'question' && entry.awaitingText) {
+    const replyTo = msg.reply_to_message?.message_id ?? null;
+
+    if (replyTo) {
+        for (const [id, entry] of Object.entries(store)) {
+            if (entry.type !== 'question' || !entry.awaitingText) continue;
+            if ((now - Number(entry.timestamp || 0)) > QUESTION_TTL_MS) continue;
+            if (entry.customPromptMessageId === replyTo || entry.messageId === replyTo) {
+                matchedId = id;
+                matchedEntry = entry;
+                break;
+            }
+        }
+    }
+
+    if (!matchedId || !matchedEntry) {
+        for (const [id, entry] of Object.entries(store)) {
+            if (entry.type !== 'question' || !entry.awaitingText) continue;
+            if ((now - Number(entry.timestamp || 0)) > QUESTION_TTL_MS) continue;
             matchedId = id;
             matchedEntry = entry;
             break;
         }
     }
 
+    if (!matchedId || !matchedEntry) {
+        let latestId = null;
+        let latestEntry = null;
+        for (const [id, entry] of Object.entries(store)) {
+            if (entry.type !== 'question') continue;
+            if (!entry.awaitingText) continue;
+            if ((now - Number(entry.timestamp || 0)) > QUESTION_TTL_MS) continue;
+            if (!latestEntry || Number(entry.timestamp || 0) > Number(latestEntry.timestamp || 0)) {
+                latestId = id;
+                latestEntry = entry;
+            }
+        }
+        if (latestId && latestEntry) {
+            matchedId = latestId;
+            matchedEntry = latestEntry;
+            console.log(`[PermListener] ℹ️ 直接文本回答模式: 使用最近 question ${matchedId}`);
+        }
+    }
+
     if (!matchedId || !matchedEntry) return;
 
     try {
-        const requestID = await replyQuestion(matchedEntry, msg.text);
+        const requestID = await replyQuestion(matchedEntry, normalized);
         if (matchedEntry.chatId && matchedEntry.messageId) {
             await editExpiredMessage(matchedEntry.chatId, matchedEntry.messageId);
         }
         removePending(matchedId);
         console.log(`[PermListener] ✅ 自定义回答已回传 OpenCode: requestID=${requestID}`);
+        await sendInfoMessage(msg.chat.id, `✅ 已提交自定义回答：${normalized}`);
     } catch (err) {
         console.error('[PermListener] ❌ 自定义回答回传失败:', err.message);
         await sendErrorMessage(msg.chat.id, `自定义回答回传失败: ${err.message}`);

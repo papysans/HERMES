@@ -64,6 +64,19 @@
 8. 成功后编辑 Telegram 消息并清理 pending。  
 9. OpenCode question tool 状态变为 `completed`，会话继续执行。
 
+### 4.1 自定义回答分支（Telegram 群组）
+
+1. 用户点击 `qcustom:<uniqueId>`。  
+2. Listener 将 pending 标记为 `awaitingText=true`，并发送 `force_reply` 提示消息。  
+3. 用户必须 reply 这条提示消息输入文本答案。  
+4. Listener 优先用 `reply_to_message.message_id` 匹配 `customPromptMessageId`。  
+5. 匹配成功后执行 `/question/{requestID}/reply`，并清理 pending。  
+
+回退逻辑：
+
+1. 若没有 reply 关系，仍可按“最近活跃 question + 文本消息”做回退匹配。  
+2. 但在并发会话下存在误命中风险，因此文档与交互均推荐 reply 模式。
+
 ## 5. 数据模型（pending-store）
 
 `type=question` 关键字段：
@@ -102,6 +115,12 @@ requestID 解析策略（按优先级）：
 3. `reply` 非 2xx：回传失败，保留上下文并输出错误消息。  
 4. `reject` 失败：仅告警，不影响主轮询。  
 
+补充（自定义回答）：
+
+1. 用户把文本发给业务机器人（如 `@Napsta...`）而非 reply Permission Bot，会被当作普通任务转发，question 保持 pending。  
+2. 群组启用隐私模式且未正确放行消息时，Listener 只能收到 callback，收不到文本消息。  
+3. 出现 `fetch failed` 时先区分链路：若 callback 已成功回传 question，则该错误通常为非致命网络抖动。
+
 ## 8. 实现边界
 
 1. `hermes-hook.js` 不阻塞 question 工具执行，不抛出业务异常。  
@@ -122,10 +141,18 @@ curl -s "http://127.0.0.1:4096/question?directory=$PWD" | jq '.'
 2. 回答后 question 是否从列表移除。  
 3. 对应 assistant message 的 tool 状态是否为 `completed`。
 
+### 9.3 Telegram 自定义回答排障日志
+
+以下日志可作为最小证据链：
+
+1. 收到按钮：`[PermListener] 📥 收到 callback_query: data=qcustom:<id>`  
+2. pending 命中：`[PermListener] 📋 getPending(<id>): type=question`  
+3. 收到文本：`[PermListener] 📨 收到 message: ... replyTo=<promptMessageId>`  
+4. 回传成功：`[PermListener] ✅ question 已回传 OpenCode: requestID=...`
+
 ## 10. 关联文件
 
 1. `/Users/napstablook/.config/opencode/HERMES/opencode/hermes-hook.js`  
 2. `/Users/napstablook/.config/opencode/HERMES/opencode/lib/permission-listener.js`  
 3. `/Users/napstablook/.config/opencode/HERMES/opencode/lib/pending-store.js`  
 4. `/Users/napstablook/.config/opencode/HERMES/README.md`
-
