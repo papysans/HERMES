@@ -293,6 +293,8 @@ AI 每次都能正确解读这个格式，把它当作用户的回答继续工�
 
 **如果你知道更好的方法，或者 OpenCode 未来版本增加了 question reply API，请务必告诉我。** 详细的探测过程记录在 [`docs/question-tool-api-exploration_2026-02-11.md`](docs/question-tool-api-exploration_2026-02-11.md)。
 
+最新一次联调问题总结见：[`docs/问题排查_OpenCode队列阻塞与InvalidApiKey_2026-02-13.md`](docs/问题排查_OpenCode队列阻塞与InvalidApiKey_2026-02-13.md)。
+
 ### 通知类型
 
 | 消息 | 含义 |

@@ -133,6 +133,22 @@ async function sendErrorMessage(chatId, text) {
 
 // --- Question answer helpers ---
 
+/**
+ * 将答案发送到 OpenCode（仅限权限相关或未来非 question 用途）。
+ *
+ * ⚠️ 此函数 **禁止** 从 question 回调处理路径调用。
+ *
+ * Question 答案的正确路径是：
+ *   1. Permission Listener 写入 Pending Store 的 `answer` 字段（updatePending）
+ *   2. hermes-hook.js 的 Polling Loop 检测到 answer
+ *   3. Polling Loop 通过 throw Error 将答案注入 AI
+ *
+ * 直接调用此函数发送 question 答案会与 Polling Loop 产生竞争条件，
+ * 且 prompt_async 回退路径可能被 Agent 利用来自主回答（参见 P5/P6 问题记录）。
+ *
+ * @param {string} sessionId - OpenCode session ID
+ * @param {string} content - 要发送的内容
+ */
 async function sendAnswerToOpenCode(sessionId, content) {
     const port = OPENCODE_PORT;
 
@@ -197,14 +213,11 @@ async function handleQuestionCallback(query) {
         const answerValue = option?.value || option?.label || `选项 ${parsed.optionIndex + 1}`;
         const answerLabel = option?.label || answerValue;
 
-        try {
-            await sendAnswerToOpenCode(pending.sid, answerValue);
-            await answerCallback(queryId, `✅ 已选择: ${answerLabel}`);
-            await editMessageResult(message.chat.id, message.message_id, message.text, `✅ 已选择: ${answerLabel}`);
-            removePending(parsed.uniqueId);
-        } catch (err) {
-            await answerCallback(queryId, `发送失败: ${err.message}`);
-        }
+        // 写入 answer 字段，由 hermes-hook.js 轮询端读取并 throw Error
+        // 不再调用 sendAnswerToOpenCode、editMessage、removePending — 轮询端统一处理
+        updatePending(parsed.uniqueId, { answer: answerValue });
+        await answerCallback(queryId, `✅ 已选择: ${answerLabel}`);
+        console.log(`[PermListener] ✅ 问题回答已写入 pending store: ${answerLabel}`);
     } else if (parsed.type === 'custom') {
         updatePending(parsed.uniqueId, {
             awaitingText: true,
@@ -237,23 +250,10 @@ async function handleTextMessage(msg) {
 
     if (!matchedId || !matchedEntry) return;
 
-    try {
-        await sendAnswerToOpenCode(matchedEntry.sid, msg.text);
-
-        if (matchedEntry.chatId && matchedEntry.messageId) {
-            await editMessageResult(
-                matchedEntry.chatId,
-                matchedEntry.messageId,
-                '',
-                `✅ 自定义回答: ${msg.text.slice(0, 100)}`
-            );
-        }
-
-        removePending(matchedId);
-        console.log(`[PermListener] ✅ 自定义回答已转发: ${msg.text.slice(0, 50)}`);
-    } catch (err) {
-        console.error('[PermListener] ❌ 自定义回答转发失败:', err.message);
-    }
+    // 写入 answer 字段，由 hermes-hook.js 轮询端读取并 throw Error
+    // 不再调用 sendAnswerToOpenCode、editMessage、removePending — 轮询端统一处理
+    updatePending(matchedId, { answer: msg.text, awaitingText: false });
+    console.log(`[PermListener] ✅ 自定义回答已写入 pending store: ${msg.text.slice(0, 50)}`);
 }
 
 // --- Core: handleCallbackQuery ---

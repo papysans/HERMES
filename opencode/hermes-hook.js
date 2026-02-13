@@ -64,7 +64,12 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
 
     // 拦截 question tool — Agent 向用户提问时推送到 Telegram，阻塞轮询等待回答
     'tool.execute.before': async (input, output) => {
-      if (input.tool === 'question' && PERMISSION_BOT_TOKEN) {
+      if (input.tool !== 'question' || !PERMISSION_BOT_TOKEN) return;
+
+      const startTime = Date.now();
+      debugLog(startTime, 'hook_enter', { tool: input.tool });
+
+      try {
         const args = output.args || {};
         const options = (args.questions?.[0]?.options) || [];
         // 提前提取问题文本（避免 output.args 被运行时修改导致后续 .map 失败）
@@ -79,6 +84,8 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
         // 获取 session ID 和 call ID
         const sessionId = input.sessionId || await getActiveSessionId();
         const callID = input.callID || input.callId || '';
+
+        debugLog(startTime, 'params_extracted', { questionCount: questionTexts.length, optionCount: options.length });
 
         // 存入 pending store
         addPending(uniqueId, {
@@ -95,6 +102,7 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
 
         // 发送到 Telegram
         let messageId = null;
+        debugLog(startTime, 'telegram_send_start');
         try {
           const res = await fetch(`https://api.telegram.org/bot${PERMISSION_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
@@ -114,8 +122,10 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
               messageId
             });
           }
+          debugLog(startTime, 'telegram_send_done', { ok: data.ok, messageId });
           console.log('[Hermes] ✅ question 已推送到 Telegram (interactive)');
         } catch (err) {
+          debugLog(startTime, 'telegram_send_done', { ok: false, error: err.message });
           console.error('[Hermes] ❌ question 推送失败:', err.message);
           return; // 发送失败，正常返回让 TUI 显示对话框
         }
@@ -123,10 +133,15 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
         // 阻塞轮询：等待 Telegram 用户回答或超时
         const POLL_INTERVAL = 1000;
         const POLL_TIMEOUT = 5 * 60 * 1000; // 5 分钟
-        const startTime = Date.now();
+
+        debugLog(startTime, 'poll_start');
+        let iteration = 0;
 
         while (true) {
           await new Promise(r => setTimeout(r, POLL_INTERVAL));
+          iteration++;
+          debugLog(startTime, 'poll_iteration', { iteration });
+
           let entry;
           try {
             entry = getPendingFn(uniqueId);
@@ -136,6 +151,8 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
           const result = shouldStopPolling(entry, startTime, POLL_TIMEOUT, Date.now());
 
           if (result.stop) {
+            debugLog(startTime, 'poll_exit', { reason: result.reason, iteration });
+
             if (result.reason === 'answered') {
               // 更新 Telegram 消息：显示已选择的答案，移除键盘
               const answerText = entry?.answer ?? '';
@@ -154,6 +171,14 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
             }
           }
         }
+      } catch (err) {
+        debugLog(startTime, 'catch_error', {
+          name: err.name, message: err.message,
+          stack: err.stack?.split('\n').slice(0, 3)
+        });
+        throw err; // 重新抛出（answered 路径的 throw 需要传播）
+      } finally {
+        debugLog(startTime, 'finally_exit', { totalMs: Date.now() - startTime });
       }
     }
   };
@@ -176,17 +201,81 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
     return '';
   }
 
+  // --- Autonomy Log Helper ---
+
+  async function appendAutonomyLog(entry) {
+    try {
+      const fs = await import('node:fs');
+      fs.appendFileSync('/tmp/hermes-autonomy.log', JSON.stringify(entry) + '\n');
+    } catch (err) {
+      console.log('[Hermes] autonomy log 写入失败 (non-fatal):', err.message);
+    }
+  }
+
+  // --- Debug Log Helper ---
+
+  function debugLog(startTime, phase, context = {}) {
+    if (!process.env.HERMES_DEBUG) return;
+    const entry = buildDebugLogEntry(phase, Date.now() - startTime, context);
+    try {
+      const fs = require('node:fs');
+      fs.appendFileSync('/tmp/hermes-question-debug.log',
+        JSON.stringify(entry) + '\n');
+    } catch (_) { }
+  }
+
   // --- Event Handlers ---
 
   async function handleSessionIdle(event) {
+    // DEBUG: 打印完整事件结构，用于诊断 sessionId 提取
+    try {
+      const fs = await import('node:fs');
+      fs.appendFileSync('/tmp/hermes-idle-debug.log',
+        JSON.stringify({ ts: new Date().toISOString(), event }, null, 2) + '\n---\n');
+    } catch (_) { }
+
     // session.idle 事件不携带消息内容，需要通过 HTTP API 获取最后一条回复
     const sessionId = event.properties?.sessionID
       || event.sessionID || event.sessionId
       || event.session?.id || '';
 
+    console.log(`[Hermes] session.idle 收到: sessionId="${sessionId}" keys=${JSON.stringify(Object.keys(event))}`);
+
     if (!sessionId) {
       console.log('[Hermes] 跳过 idle 事件：无 sessionId');
       return;
+    }
+
+    const startTime = Date.now();
+    debugLog(startTime, 'idle_enter', { sessionId });
+
+    // 新增：检查是否有活跃的 question
+    const { isQuestionActive, getActiveQuestionId, loadStore: loadPendingStore } = await getPendingStore();
+    const questionActive = isQuestionActive(sessionId);
+
+    // 读取 store 摘要用于调试
+    const store = loadPendingStore();
+    debugLog(startTime, 'idle_check', {
+      sessionId, questionActive,
+      storeSize: Object.keys(store).length,
+      questionEntries: Object.entries(store)
+        .filter(([_, e]) => e.type === 'question')
+        .map(([id, e]) => ({ id, sid: e.sid, hasAnswer: e.answer !== undefined, age: Date.now() - e.timestamp }))
+    });
+
+    console.log(`[Hermes] isQuestionActive("${sessionId}") = ${questionActive}`);
+    if (questionActive) {
+      const questionId = getActiveQuestionId(sessionId);
+      debugLog(startTime, 'idle_suppressed', { questionId });
+      console.log(`[Hermes] ⚠️ session.idle 被抑制：question ${questionId} 仍在等待回答`);
+      await appendAutonomyLog(buildAutonomyLogEntry(
+        new Date().toISOString(),
+        'autonomy_suppressed',
+        sessionId,
+        questionId,
+        '' // 不获取消息内容，避免不必要的 API 调用
+      ));
+      return; // 抑制通知
     }
 
     // 通过 OpenCode HTTP API 获取最近消息
@@ -643,4 +732,69 @@ export function shouldStopPolling(entry, startTime, timeout, now) {
   if (entry.answer !== undefined) return { stop: true, reason: 'answered' };
   if (currentTime - startTime >= timeout) return { stop: true, reason: 'timeout' };
   return { stop: false };
+}
+
+/**
+ * 构建自主行为检测日志条目。纯函数，用于 autonomy log (JSONL)。
+ *
+ * @param {string} timestamp       - ISO 8601 时间戳
+ * @param {string} eventType       - 事件类型 (e.g. 'autonomy_suppressed')
+ * @param {string} sessionId       - OpenCode session ID
+ * @param {string|null} questionId - 活跃 question 的 uniqueId
+ * @param {string} contentPreview  - 被抑制内容的预览（截断到 200 字符）
+ * @returns {{ timestamp: string, event: string, sessionId: string, questionId: string|null, contentPreview: string }}
+ */
+export function buildAutonomyLogEntry(timestamp, eventType, sessionId, questionId, contentPreview) {
+  return {
+    timestamp,
+    event: eventType,
+    sessionId: sessionId || '',
+    questionId: questionId || null,
+    contentPreview: (contentPreview || '').slice(0, 200)
+  };
+}
+
+/**
+ * 构建调试日志条目（纯函数，可测试）。
+ *
+ * @param {string} phase     - 阶段名称（如 'hook_enter', 'poll_start'）
+ * @param {number} elapsedMs - 距进入钩子的毫秒数
+ * @param {Object} context   - 阶段特定的上下文数据
+ * @returns {{ ts: string, phase: string, elapsedMs: number, [key: string]: any }}
+ */
+export function buildDebugLogEntry(phase, elapsedMs, context = {}) {
+  return {
+    ts: new Date().toISOString(),
+    phase: phase ?? '',
+    elapsedMs: elapsedMs ?? 0,
+    ...((context && typeof context === 'object' && !Array.isArray(context)) ? context : {})
+  };
+}
+
+
+
+/**
+ * 根据调试日志阶段序列诊断 throw 提前发生的根因。
+ *
+ * 分类规则（按优先级顺序）：
+ * 1. fetch_post_error — Telegram 发送完成但轮询未开始就退出
+ * 2. hook_timeout    — 轮询开始但第一次迭代未完成就退出
+ * 3. external_abort  — finally 执行但无 catch（非 JS 异常中止）
+ * 4. code_error      — catch 块捕获到异常
+ * 5. normal          — 以上均不匹配
+ *
+ * @param {string[]} phases - 阶段名称字符串数组
+ * @returns {'fetch_post_error' | 'hook_timeout' | 'external_abort' | 'code_error' | 'normal'}
+ */
+export function diagnoseCause(phases) {
+  if (!Array.isArray(phases)) return 'normal';
+
+  const has = (p) => phases.includes(p);
+
+  if (has('telegram_send_done') && !has('poll_start') && has('finally_exit')) return 'fetch_post_error';
+  if (has('poll_start') && !has('poll_iteration') && has('finally_exit')) return 'hook_timeout';
+  if (has('finally_exit') && !has('catch_error')) return 'external_abort';
+  if (has('catch_error')) return 'code_error';
+
+  return 'normal';
 }
