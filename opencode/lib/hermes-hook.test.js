@@ -1,5 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fc from 'fast-check';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
     buildPermissionMessage,
     assessRisk,
@@ -316,7 +318,23 @@ describe('Pending Store answer round-trip — Property-Based Tests', () => {
 });
 
 // --- PBT: Property 1 (hermes-agent-question-autonomy) — isQuestionActive/getActiveQuestionId consistency ---
-import { isQuestionActive, getActiveQuestionId, QUESTION_TTL_MS, loadStore, saveStore } from './pending-store.js';
+import {
+    isQuestionActive,
+    getActiveQuestionId,
+    QUESTION_TTL_MS,
+    loadStore,
+    saveStore,
+    __setPendingStorePathForTest
+} from './pending-store.js';
+
+const TEST_PENDING_STORE_PATH = join(tmpdir(), `hermes-pending-test-${process.pid}-${Date.now()}.json`);
+beforeAll(() => {
+    __setPendingStorePathForTest(TEST_PENDING_STORE_PATH);
+    saveStore({});
+});
+afterAll(() => {
+    saveStore({});
+});
 
 describe('isQuestionActive/getActiveQuestionId consistency — Property-Based Tests', () => {
     const now = Date.now();

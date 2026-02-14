@@ -23,6 +23,8 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
   // Lazy imports — 避免顶层 import 导致 OpenCode 插件加载失败
   let _pendingStore = null;
   let _crypto = null;
+  let _controlState = null;
+  let _debugFsPromise = null;
   async function getPendingStore() {
     if (!_pendingStore) _pendingStore = await import('./lib/pending-store.js');
     return _pendingStore;
@@ -30,6 +32,10 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
   async function getCrypto() {
     if (!_crypto) _crypto = await import('node:crypto');
     return _crypto;
+  }
+  async function getControlState() {
+    if (!_controlState) _controlState = await import('./lib/control-state.js');
+    return _controlState;
   }
 
   // 用 client.app.log 做结构化日志（TUI 可见），同时 console.log 兜底
@@ -74,7 +80,11 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
         const args = output.args || {};
         const options = (args.questions?.[0]?.options) || [];
         const crypto = await getCrypto();
-        const { addPending, updatePending: updatePendingFn } = await getPendingStore();
+        const {
+          addPending,
+          updatePending: updatePendingFn,
+          removePending
+        } = await getPendingStore();
         const uniqueId = crypto.randomUUID().slice(0, 8);
 
         // 获取 session ID 和 call ID
@@ -115,17 +125,24 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
               reply_markup: keyboard
             })
           });
-          const data = await res.json();
-          if (data.ok) {
-            messageId = data.result.message_id;
-            updatePendingFn(uniqueId, {
-              chatId: TELEGRAM_CHANNEL,
-              messageId
-            });
+          if (!res.ok) {
+            const errText = await res.text().catch(() => '');
+            throw new Error(`Telegram HTTP ${res.status}: ${errText}`);
           }
+          const data = await res.json();
+          if (!data.ok) {
+            throw new Error(`Telegram API error: ${data.description || 'unknown'}`);
+          }
+          messageId = data.result.message_id;
+          updatePendingFn(uniqueId, {
+            chatId: TELEGRAM_CHANNEL,
+            messageId
+          });
+          await markTakeoverProgress(sessionId, 'question.asked');
           debugLog(startTime, 'telegram_send_done', { ok: data.ok, messageId });
           console.log('[Hermes] ✅ question 已推送到 Telegram (interactive)');
         } catch (err) {
+          try { removePending(uniqueId); } catch { /* ignore rollback failure */ }
           debugLog(startTime, 'telegram_send_done', { ok: false, error: err.message });
           console.error('[Hermes] ❌ question 推送失败:', err.message);
           return; // 发送失败，保持 OpenCode 默认本地交互
@@ -177,11 +194,12 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
   function debugLog(startTime, phase, context = {}) {
     if (!process.env.HERMES_DEBUG) return;
     const entry = buildDebugLogEntry(phase, Date.now() - startTime, context);
-    try {
-      const fs = require('node:fs');
-      fs.appendFileSync('/tmp/hermes-question-debug.log',
-        JSON.stringify(entry) + '\n');
-    } catch (_) { }
+    if (!_debugFsPromise) _debugFsPromise = import('node:fs');
+    _debugFsPromise
+      .then((fs) => {
+        fs.appendFileSync('/tmp/hermes-question-debug.log', JSON.stringify(entry) + '\n');
+      })
+      .catch(() => { /* ignore */ });
   }
 
   // --- Event Handlers ---
@@ -280,17 +298,22 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
       await sendToOpenClaw(msg);
       console.log('[Hermes] ✅ phase_complete 已发送 (via OpenClaw)');
     }
+
+    // 记录里程碑进度，供接管模式卡住检测使用
+    await markTakeoverProgress(sessionId, 'session.idle');
   }
 
   async function handlePermissionAsked(event) {
     const props = event.properties || {};
 
     // 持久化 event 到文件，方便调试不同类型的 permission
-    try {
-      const fs = await import('node:fs');
-      const ts = new Date().toISOString().replace(/[:.]/g, '-');
-      fs.writeFileSync(`/tmp/hermes-perm-${ts}.json`, JSON.stringify(event, null, 2));
-    } catch (_) { }
+    if (process.env.HERMES_DUMP_PERMISSION_EVENTS === '1') {
+      try {
+        const fs = await import('node:fs');
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        fs.writeFileSync(`/tmp/hermes-perm-${ts}.json`, JSON.stringify(event, null, 2));
+      } catch (_) { }
+    }
 
     const permissionId = props.id || '';
     const sessionId = props.sessionID || '';
@@ -317,6 +340,7 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
     // 直接发送到 Telegram（不走 OpenClaw Agent）
     if (PERMISSION_BOT_TOKEN) {
       await sendPermissionToTelegram(sessionId, permissionId, permType, command, risk, alwaysPattern);
+      await markTakeoverProgress(sessionId, 'permission.asked');
       console.log('[Hermes] ✅ permission 已直发 Telegram');
     } else {
       // 回退：Permission Bot 未配置时走旧路径
@@ -329,7 +353,11 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
 
   async function sendPermissionToTelegram(sessionId, permissionId, permType, command, risk, alwaysPattern) {
     const crypto = await getCrypto();
-    const { addPending, updatePending: updatePendingFn } = await getPendingStore();
+    const {
+      addPending,
+      updatePending: updatePendingFn,
+      removePending
+    } = await getPendingStore();
     const uniqueId = crypto.randomUUID().slice(0, 8);
 
     // 1. 存入 pending store
@@ -357,8 +385,17 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
       })
     });
 
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      try { removePending(uniqueId); } catch { /* ignore rollback failure */ }
+      throw new Error(`Telegram HTTP ${res.status}: ${errText}`);
+    }
+
     const data = await res.json();
-    if (!data.ok) throw new Error(`Telegram API error: ${data.description}`);
+    if (!data.ok) {
+      try { removePending(uniqueId); } catch { /* ignore rollback failure */ }
+      throw new Error(`Telegram API error: ${data.description}`);
+    }
 
     // 4. 更新 store 中的 messageId（用于后续编辑消息）
     updatePendingFn(uniqueId, {
@@ -371,6 +408,7 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
     const props = event.properties || event;
     const errorMsg = props.message || props.error || 'Unknown error';
     const msg = `❌ ERROR: ${errorMsg}`;
+    const sessionId = props.sessionID || props.sessionId || props.session?.id || '';
 
     // 优先直发 Telegram（绕过 Agent），回退到 OpenClaw
     if (PERMISSION_BOT_TOKEN) {
@@ -379,6 +417,29 @@ export const HermesPlugin = async ({ client, $, project, directory }) => {
     } else {
       await sendToOpenClaw(msg);
       console.log('[Hermes] ✅ error 已发送 (via OpenClaw)');
+    }
+
+    await markTakeoverBlocked(sessionId, errorMsg);
+  }
+
+  async function markTakeoverProgress(sessionId, source) {
+    try {
+      const { markProgress } = await getControlState();
+      markProgress(sessionId, { lastProgressSource: source || '' });
+    } catch (err) {
+      console.log('[Hermes] markTakeoverProgress 失败 (non-fatal):', err.message);
+    }
+  }
+
+  async function markTakeoverBlocked(sessionId, reason) {
+    try {
+      const { markBlocked } = await getControlState();
+      markBlocked(reason || 'session.error', {
+        activeSessionId: sessionId || '',
+        blockedAt: Date.now()
+      });
+    } catch (err) {
+      console.log('[Hermes] markTakeoverBlocked 失败 (non-fatal):', err.message);
     }
   }
 
@@ -551,7 +612,7 @@ export function buildTelegramPermissionMessage(permType, command, risk, alwaysPa
   const lines = [
     `🔴 *需要确认* \\[${permType}]`,
     '',
-    `*命令:* \`${command}\``,
+    `*命令:* ${escapeMd(command)}`,
     `*风险:* ${riskEmoji} ${risk}`,
   ];
   if (alwaysPattern) {

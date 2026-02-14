@@ -46,6 +46,7 @@ HERMES/
 │   ├── hermes-hook.js              # OpenCode 插件（方向 B）
 │   └── lib/
 │       ├── pending-store.js        # 待处理请求存储（权限 + 问题，JSON 文件）
+│       ├── control-state.js         # 接管编排状态存储（模式/Agent/skill/进度）
 │       ├── permission-listener.js  # Telegram 回调监听（权限 + 问题，独立进程）
 │       └── hermes-hook.test.js     # 测试（Vitest + fast-check PBT）
 ├── openclaw/
@@ -152,6 +153,7 @@ cp opencode/hermes-hook.js ~/.config/opencode/plugins/
 # lib 目录（OpenCode 不递归扫描子目录，所以 lib/ 下的文件不会被当作插件加载）
 mkdir -p ~/.config/opencode/plugins/lib
 cp opencode/lib/pending-store.js ~/.config/opencode/plugins/lib/
+cp opencode/lib/control-state.js ~/.config/opencode/plugins/lib/
 cp opencode/lib/permission-listener.js ~/.config/opencode/plugins/lib/
 ```
 
@@ -164,6 +166,14 @@ export HERMES_HOOK_TOKEN="<和 openclaw.json hooks.token 一致>"
 export HERMES_OPENCLAW_URL="http://localhost:18789"
 export HERMES_TELEGRAM_CHANNEL="<你的群组 ID>"
 export HERMES_PERMISSION_BOT_TOKEN="<Permission Bot Token（推荐，启用直发 Telegram）>"
+
+# 可选：状态/存储文件（默认在 /tmp）
+export HERMES_PENDING_STORE_PATH="/tmp/hermes-pending.json"
+export HERMES_CONTROL_STATE_PATH="/tmp/hermes-control-state.json"
+
+# 可选：文件权限（八进制）
+export HERMES_PENDING_STORE_MODE="600"
+export HERMES_CONTROL_STATE_MODE="660"
 ```
 
 然后 `source ~/.zshrc`。
@@ -206,6 +216,15 @@ curl -X POST http://localhost:18789/hooks/agent \
   }'
 ```
 
+### 5. 运行目录同步与校验（推荐）
+
+为避免 `HERMES/opencode` 与 `~/.config/opencode/plugins` 漂移，建议每次改动后执行：
+
+```bash
+bash HERMES/scripts/sync-runtime.sh
+bash HERMES/scripts/check-plugins.sh
+```
+
 ## 使用方式
 
 ### 发送需求
@@ -224,6 +243,29 @@ curl -X POST http://localhost:18789/hooks/agent \
 （查一下当前 session）
 （状态怎么样）
 ```
+
+### 接管编排控制指令（Telegram）
+
+以下控制指令在群组发送即可（建议使用括号）：
+
+1. `（模式:转发）`
+2. `（模式:协同）`
+3. `（模式:代决策）`
+4. `（接管: <目标>）`
+5. `（停止接管）`
+6. `（选择Agent）`
+7. `（skill:plan|execute|debug|review）`
+
+> `skill` 仅允许 `plan/execute/debug/review`，无效值会直接报错，不再静默降级。
+
+说明：
+- `forward`：原样转发
+- `copilot`：任务封装转发 + 里程碑推进
+- `delegate`：代推进一般步骤，但高风险权限仍必须按钮确认
+
+`（选择Agent）` 会由 Permission Bot 弹出按钮菜单：
+- 选择 oh-my-opencode Agent（来自 `~/.config/opencode/oh-my-opencode.json`）
+- 选择 superpowers skill profile（`plan/execute/debug/review`）
 
 ### 权限审批
 
@@ -331,6 +373,25 @@ Question Tool 官方回传技术文档见：[`docs/技术文档_QuestionTool官�
 | `question` | Agent 提问 | `sid`, `callID`, `options`, `awaitingText` |
 
 TTL 30 分钟，原子写入（tmp+rename），重启后自动清理过期条目。
+
+### Control State（接管编排状态）
+
+`/tmp/hermes-control-state.json` 用于管理编排模式和接管状态：
+
+| 字段 | 含义 |
+|------|------|
+| `mode` | `forward/copilot/delegate` |
+| `selectedAgent` | 手选 oh-my agent（默认 `sisyphus`） |
+| `selectedSkillProfile` | `plan/execute/debug/review` |
+| `takeoverActive` | 是否处于接管执行 |
+| `takeoverGoal` | 当前接管目标 |
+| `lastProgressAt` | 最近里程碑时间戳 |
+| `activeSessionId` | 绑定的 OpenCode session |
+
+卡住策略：
+- 默认 90 秒无进展告警（Telegram + 本地日志）
+- 同阶段最多自动重投 1 次
+- 重投后仍卡住则标记 `blocked`，等待人工决策
 
 ### 问题回答投递（官方 Question API）
 
