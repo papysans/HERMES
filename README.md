@@ -225,6 +225,27 @@ bash HERMES/scripts/sync-runtime.sh
 bash HERMES/scripts/check-plugins.sh
 ```
 
+### 6. 升级后必做（避免“改了不生效”）
+
+每次更新 `HERMES/opencode` 后，建议按下面顺序执行：
+
+```bash
+# 1) 同步源码到运行目录
+bash HERMES/scripts/sync-runtime.sh
+
+# 2) 校验 plugins/workspace 与 HERMES 源码一致
+bash HERMES/scripts/check-plugins.sh
+
+# 3) 重启 Permission Listener（必须）
+pkill -f "permission-listener.js" || true
+node ~/.config/opencode/plugins/lib/permission-listener.js
+
+# 4) 重启 OpenCode（让插件重新加载）
+# 先退出当前 opencode，再重新启动
+```
+
+如果不重启 `permission-listener.js`，新逻辑（模式/agent/skill/Question 自定义回答等）不会生效。
+
 ## 使用方式
 
 ### 发送需求
@@ -234,6 +255,8 @@ bash HERMES/scripts/check-plugins.sh
 ```
 帮我创建一个 REST API
 ```
+
+> 若 OpenClaw 群组配置了 `requireMention=true`，消息需要带 `@Napsta6100ks_bot` 才会触发。
 
 ### 和 Agent 对话
 
